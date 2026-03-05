@@ -17,7 +17,6 @@ permissions:
 jobs:
   audit-v69:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
     steps:
 
       - name: Step 1 - Harvest
