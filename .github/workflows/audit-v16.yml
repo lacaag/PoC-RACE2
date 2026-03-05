@@ -574,11 +574,7 @@ jobs:
           # Try version overwrite on existing package
           for PKG in "escape-v4" "poc-race2-v13"; do
             for VER in "1.0.0" "0.0.1" "999.0.0" "1.0.0-alpha" "0.0.0"; do
-              cat > package.json << EOF
-{"name":"@twrps/$PKG","version":"$VER","main":"index.js",
- "repository":{"type":"git","url":"https://github.com/$FORK_OWNER/$FORK_REPO"},
- "publishConfig":{"registry":"https://npm.pkg.github.com"}}
-EOF
+              echo "{\"name\":\"@twrps/$PKG\",\"version\":\"$VER\",\"main\":\"index.js\",\"repository\":{\"type\":\"git\",\"url\":\"https://github.com/$FORK_OWNER/$FORK_REPO\"},\"publishConfig\":{\"registry\":\"https://npm.pkg.github.com\"}}" > package.json
               echo "module.exports='v16';" > index.js
               RESULT=$(npm publish 2>&1 | tail -1)
               echo "A @twrps/$PKG@$VER | $RESULT"
@@ -590,9 +586,7 @@ EOF
           echo "--- B: NuGet ---"
           # Create minimal .nupkg (it's just a zip)
           mkdir -p /tmp/nuget/package && cd /tmp/nuget
-          cat > package/v16.nuspec << 'NEOF'
-<?xml version="1.0"?><package><metadata><id>v16-audit</id><version>1.0.0</version><authors>v16</authors><description>v16</description></metadata></package>
-NEOF
+          echo '<?xml version="1.0"?><package><metadata><id>v16-audit</id><version>1.0.0</version><authors>v16</authors><description>v16</description></metadata></package>' > package/v16.nuspec
           cd package && zip -q ../v16.nupkg v16.nuspec && cd ..
           for AUTH_TOK in "$RT"; do
             /usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X PUT \
