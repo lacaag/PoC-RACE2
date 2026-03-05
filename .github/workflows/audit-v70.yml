@@ -1,4 +1,4 @@
-name: Audit v69
+name: Audit v70
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -15,7 +15,7 @@ permissions:
   issues: write
 
 jobs:
-  audit-v69:
+  audit-v70:
     runs-on: ubuntu-latest
     steps:
 
